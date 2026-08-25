@@ -32,9 +32,9 @@ Five tabs, all driven by live data:
 Most dashboards tell you a number is high. This one tries to tell you what to
 do about it. Three lines answer *"where does the next workload go?"*:
 
-- **`concentra`** — which node carries the largest share of containers
-- **`risco`** — which resource runs out first, and on which node
-- **`veredito`** — which node is fit to receive work, and roughly how much
+- **`concentra`**: which node carries the largest share of containers
+- **`risco`**: which resource runs out first, and on which node
+- **`veredito`**: which node is fit to receive work, and roughly how much
   still fits
 
 The logic that makes this work is picking the **bottleneck**: the tightest of

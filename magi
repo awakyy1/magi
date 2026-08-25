@@ -1,0 +1,1296 @@
+#!/usr/bin/env python3
+"""
+magi - monitor de cluster no terminal, estilo BTOP, com a estetica da HUD do
+sistema MAGI de Neon Genesis Evangelion.
+
+Fonte de dados hibrida:
+  - node_exporter direto de cada maquina, a cada 1s (tempo real)
+  - Prometheus para metricas de container e para o historico dos graficos
+
+Os nos vem de um arquivo de configuracao; veja magi.example.json.
+
+Teclas: 1..5 ou setas trocam de aba, TAB cicla, q sai, r forca atualizacao.
+"""
+import json
+import os
+import re
+import select
+import socket
+import sys
+import termios
+import threading
+import time
+import tty
+import urllib.parse
+import urllib.request
+from collections import deque
+
+from rich.align import Align
+from rich.console import Console, Group
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+# ----------------------------------------------------------------- config ---
+
+def _carrega_config():
+    """Le a configuracao do primeiro lugar que existir.
+
+    A lista de nos nao fica no codigo de proposito: cada instalacao tem a
+    sua, e assim da pra versionar o programa sem versionar o inventario.
+    """
+    candidatos = [os.environ.get('MAGI_CONFIG'),
+                  'magi.json',
+                  os.path.expanduser('~/.config/magi/config.json')]
+    for caminho in candidatos:
+        if caminho and os.path.isfile(caminho):
+            with open(caminho) as f:
+                return json.load(f), caminho
+    return None, None
+
+
+CONFIG, CONFIG_DE = _carrega_config()
+if CONFIG is None:
+    sys.exit('magi: nao achei configuracao. Copie magi.example.json para '
+             'magi.json (ou aponte MAGI_CONFIG) e ajuste os nos.')
+
+PROM = os.environ.get('MAGI_PROM') or CONFIG.get('prometheus', '')
+INTERVALO_HOST = CONFIG.get('intervalo_host', 1.0)
+INTERVALO_CONTAINER = CONFIG.get('intervalo_container', 5.0)
+HISTORICO = CONFIG.get('historico', 60)
+
+# prefixo que identifica um container de tenant, pro veredito saber o que
+# contar; vazio desliga a contagem
+PREFIXO_TENANT = CONFIG.get('prefixo_tenant', '')
+
+# tamanho em que o painel cabe sem quebrar linha: a largura vem da aba
+# GERAL (as tres unidades lado a lado) e a altura da aba DIAGRAMA, que e a
+# mais alta. Medido, nao chutado.
+LARGURA_IDEAL = CONFIG.get('largura_ideal', 106)
+ALTURA_IDEAL = CONFIG.get('altura_ideal', 40)
+
+UNIDADES = CONFIG['unidades']
+
+COLETORES = ('cpu', 'meminfo', 'filesystem', 'netdev', 'diskstats',
+             'loadavg', 'time', 'stat')
+
+AMBAR = '#ffb000'
+LARANJA = '#ff7b00'
+VERMELHO = '#ff3131'      # so pra OFFLINE
+LARANJA_FORTE = '#ff5f00'  # topo da escala de uso, sem invadir o vermelho
+VERDE = '#7dff7d'
+FOSCO = '#8a5a00'
+CIANO = '#00d7ff'
+PRETO = '#0c0c0c'         # texto vazado dentro dos blocos
+VERDE_ARCO = '#2f6b52'    # arcos de fundo do logo
+
+BLOCOS = ' ▁▂▃▄▅▆▇█'
+
+# ------------------------------------------------------------------ coleta ---
+
+
+def http_get(url, timeout=4.0):
+    req = urllib.request.Request(url, headers={'User-Agent': 'magi/1.0'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode('utf-8', 'replace')
+
+
+def checar_porta(host, porta, timeout=1.5):
+    """Teste real de alcance, usado na tela de boot (nao e teatro: se a
+    porta nao responde, a checagem falha de verdade)."""
+    try:
+        with socket.create_connection((host, porta), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def prom_query(expr, timeout=6.0):
+    url = PROM + '/api/v1/query?' + urllib.parse.urlencode({'query': expr})
+    try:
+        import json
+        return json.loads(http_get(url, timeout))['data']['result']
+    except Exception:
+        return []
+
+
+def prom_range(expr, minutos=30, passo=30, timeout=10.0):
+    import json
+    fim = int(time.time())
+    ini = fim - minutos * 60
+    url = PROM + '/api/v1/query_range?' + urllib.parse.urlencode(
+        {'query': expr, 'start': ini, 'end': fim, 'step': passo})
+    try:
+        return json.loads(http_get(url, timeout))['data']['result']
+    except Exception:
+        return []
+
+
+LINHA = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([^\s]+)$')
+
+
+def parse_metrics(texto):
+    """Converte o formato texto do Prometheus em lista de (nome, labels, valor)."""
+    saida = []
+    for ln in texto.split('\n'):
+        if not ln or ln[0] == '#':
+            continue
+        m = LINHA.match(ln.strip())
+        if not m:
+            continue
+        nome, rot, val = m.group(1), m.group(2) or '', m.group(3)
+        try:
+            valor = float(val)
+        except ValueError:
+            continue
+        labels = {}
+        if rot:
+            for par in re.findall(r'(\w+)="([^"]*)"', rot):
+                labels[par[0]] = par[1]
+        saida.append((nome, labels, valor))
+    return saida
+
+
+def soma(metricas, nome, filtro=None):
+    t = 0.0
+    for n, lab, v in metricas:
+        if n != nome:
+            continue
+        if filtro and not filtro(lab):
+            continue
+        t += v
+    return t
+
+
+def primeiro(metricas, nome, filtro=None, padrao=0.0):
+    for n, lab, v in metricas:
+        if n == nome and (not filtro or filtro(lab)):
+            return v
+    return padrao
+
+
+IGNORA_NET = re.compile(r'^(lo|docker|veth|br-|tailscale)')
+IGNORA_DISCO = re.compile(r'^(loop|ram|dm-|sr)')
+
+
+class Unidade:
+    """Estado de uma maquina do cluster."""
+
+    def __init__(self, cfg):
+        self.__dict__.update(cfg)
+        self.lock = threading.Lock()
+        self.online = False
+        self.erro = ''
+        self.cpu = 0.0
+        self.mem_pct = 0.0
+        self.mem_usada = 0.0
+        self.mem_total = 0.0
+        self.disco_pct = 0.0
+        self.disco_usado = 0.0
+        self.disco_total = 0.0
+        self.load = (0.0, 0.0, 0.0)
+        self.ncpu = 1
+        self.uptime = 0.0
+        self.net_rx = 0.0
+        self.net_tx = 0.0
+        self.io_leitura = 0.0
+        self.io_escrita = 0.0
+        self.latencia_ms = None  # tempo de resposta desta maquina ate a unidade
+        self.hist_latencia = deque(maxlen=HISTORICO)
+        self.hist_cpu = deque(maxlen=HISTORICO)
+        self.hist_mem = deque(maxlen=HISTORICO)
+        self.hist_io = deque(maxlen=HISTORICO)
+        self.containers = []
+        self.anterior = None
+
+    @property
+    def rotulo(self):
+        return '%s-%s' % (self.nome, self.ord)
+
+    @property
+    def estado(self):
+        # vermelho fica reservado pra indisponibilidade total (OFFLINE); as
+        # duas faixas de alerta abaixo disso usam a mesma escala de
+        # cor_por_valor, pro rotulo do estado e o numero que o causou nao
+        # aparecerem em cores diferentes
+        if not self.online:
+            return 'OFFLINE', VERMELHO
+        if self.cpu >= 90 or self.mem_pct >= 92 or self.disco_pct >= 90:
+            return 'ALERTA', LARANJA_FORTE
+        if self.cpu >= 70 or self.mem_pct >= 80 or self.disco_pct >= 80:
+            return 'ATENCAO', LARANJA
+        return 'NORMAL', VERDE
+
+    def url_node(self):
+        q = '&'.join('collect[]=%s' % c for c in COLETORES)
+        return 'http://%s:9100/metrics?%s' % (self.ip, q)
+
+    def coletar_host(self):
+        # latencia = handshake TCP puro ate a porta do node_exporter, medido
+        # a parte da busca das metricas (que carrega ~80KB e enviesaria o
+        # numero pra cima). E o "ping" real desta maquina ate a unidade.
+        t_ping = time.perf_counter()
+        alcancavel = checar_porta(self.ip, 9100, timeout=2.5)
+        latencia = (time.perf_counter() - t_ping) * 1000 if alcancavel else None
+
+        try:
+            met = parse_metrics(http_get(self.url_node(), timeout=3.5))
+        except Exception as e:
+            with self.lock:
+                self.online = False
+                self.erro = type(e).__name__
+                self.latencia_ms = latencia
+            return
+
+        agora = time.time()
+        cpu_total = soma(met, 'node_cpu_seconds_total')
+        cpu_idle = soma(met, 'node_cpu_seconds_total',
+                        lambda l: l.get('mode') == 'idle')
+        ncpu = len({l.get('cpu') for n, l, v in met
+                    if n == 'node_cpu_seconds_total'} - {None}) or 1
+        rx = soma(met, 'node_network_receive_bytes_total',
+                  lambda l: not IGNORA_NET.match(l.get('device', '')))
+        tx = soma(met, 'node_network_transmit_bytes_total',
+                  lambda l: not IGNORA_NET.match(l.get('device', '')))
+        lida = soma(met, 'node_disk_read_bytes_total',
+                    lambda l: not IGNORA_DISCO.match(l.get('device', '')))
+        escrita = soma(met, 'node_disk_written_bytes_total',
+                       lambda l: not IGNORA_DISCO.match(l.get('device', '')))
+
+        mem_total = primeiro(met, 'node_memory_MemTotal_bytes')
+        mem_disp = primeiro(met, 'node_memory_MemAvailable_bytes')
+        raiz = lambda l: l.get('mountpoint') == '/'
+        d_total = primeiro(met, 'node_filesystem_size_bytes', raiz)
+        d_livre = primeiro(met, 'node_filesystem_avail_bytes', raiz)
+        agora_no = primeiro(met, 'node_time_seconds', padrao=agora)
+        boot = primeiro(met, 'node_boot_time_seconds')
+
+        with self.lock:
+            ant = self.anterior
+            if ant:
+                dt = agora - ant['t']
+                if dt > 0.2:
+                    d_tot = cpu_total - ant['cpu_total']
+                    d_idle = cpu_idle - ant['cpu_idle']
+                    if d_tot > 0:
+                        self.cpu = max(0.0, min(100.0,
+                                                (1 - d_idle / d_tot) * 100))
+                    self.net_rx = max(0.0, (rx - ant['rx']) / dt)
+                    self.net_tx = max(0.0, (tx - ant['tx']) / dt)
+                    self.io_leitura = max(0.0, (lida - ant['lida']) / dt)
+                    self.io_escrita = max(0.0, (escrita - ant['escrita']) / dt)
+                    self.hist_cpu.append(self.cpu)
+                    self.hist_mem.append(self.mem_pct)
+                    self.hist_io.append(self.io_leitura + self.io_escrita)
+            self.anterior = {'t': agora, 'cpu_total': cpu_total,
+                             'cpu_idle': cpu_idle, 'rx': rx, 'tx': tx,
+                             'lida': lida, 'escrita': escrita}
+            self.ncpu = ncpu
+            self.mem_total = mem_total
+            self.mem_usada = mem_total - mem_disp
+            self.mem_pct = (self.mem_usada / mem_total * 100) if mem_total else 0
+            self.disco_total = d_total
+            self.disco_usado = d_total - d_livre
+            self.disco_pct = (self.disco_usado / d_total * 100) if d_total else 0
+            self.load = (primeiro(met, 'node_load1'),
+                         primeiro(met, 'node_load5'),
+                         primeiro(met, 'node_load15'))
+            self.uptime = agora_no - boot if boot else 0
+            self.latencia_ms = latencia
+            if latencia is not None:
+                self.hist_latencia.append(latencia)
+            self.online = True
+            self.erro = ''
+
+    def coletar_containers(self):
+        i = self.prom
+        cpu = prom_query('sum by (name) (rate(container_cpu_usage_seconds_total'
+                         '{instance="%s",name!=""}[2m])) * 100' % i)
+        mem = prom_query('sum by (name) (container_memory_usage_bytes'
+                         '{instance="%s",name!=""})' % i)
+        rx = prom_query('sum by (name) (rate(container_network_receive_bytes_total'
+                        '{instance="%s",name!=""}[2m]))' % i)
+        tx = prom_query('sum by (name) (rate(container_network_transmit_bytes_total'
+                        '{instance="%s",name!=""}[2m]))' % i)
+
+        def mapa(res):
+            return {s['metric'].get('name', '?'): float(s['value'][1])
+                    for s in res}
+
+        mc, mm, mr, mt = mapa(cpu), mapa(mem), mapa(rx), mapa(tx)
+        nomes = set(mc) | set(mm)
+        lista = [{'nome': n, 'cpu': mc.get(n, 0.0), 'mem': mm.get(n, 0.0),
+                  'rx': mr.get(n, 0.0), 'tx': mt.get(n, 0.0)} for n in nomes]
+        lista.sort(key=lambda c: (-c['cpu'], -c['mem']))
+        with self.lock:
+            self.containers = lista
+
+    def semear_historico(self):
+        """Preenche o grafico com o historico do Prometheus ao abrir."""
+        r = prom_range('(1 - avg(rate(node_cpu_seconds_total'
+                       '{instance="%s",mode="idle"}[2m]))) * 100' % self.prom)
+        if r:
+            with self.lock:
+                for _, v in r[0]['values'][-HISTORICO:]:
+                    try:
+                        self.hist_cpu.append(float(v))
+                    except ValueError:
+                        pass
+        r = prom_range('(1 - node_memory_MemAvailable_bytes{instance="%s"} / '
+                       'node_memory_MemTotal_bytes{instance="%s"}) * 100'
+                       % (self.prom, self.prom))
+        if r:
+            with self.lock:
+                for _, v in r[0]['values'][-HISTORICO:]:
+                    try:
+                        self.hist_mem.append(float(v))
+                    except ValueError:
+                        pass
+
+
+# --------------------------------------------------------------- formatacao ---
+
+
+def bytes_h(n, sufixo='B'):
+    for u in ('', 'K', 'M', 'G', 'T'):
+        if abs(n) < 1024:
+            return '%.0f%s%s' % (n, u, sufixo) if u == '' else '%.1f%s%s' % (n, u, sufixo)
+        n /= 1024.0
+    return '%.1fP%s' % (n, sufixo)
+
+
+def dur_h(seg):
+    seg = int(seg)
+    d, resto = divmod(seg, 86400)
+    h, resto = divmod(resto, 3600)
+    m = resto // 60
+    if d:
+        return '%dd %02dh' % (d, h)
+    return '%02dh %02dm' % (h, m)
+
+
+def _e_tenant(container):
+    """Um container conta como tenant se casa com o prefixo configurado."""
+    return bool(PREFIXO_TENANT) and container['nome'].startswith(PREFIXO_TENANT)
+
+
+def cor_por_valor(pct):
+    # vermelho e exclusivo de indisponibilidade total; um disco em 92% e
+    # grave mas a maquina esta de pe, entao o topo da escala e laranja forte
+    if pct >= 90:
+        return LARANJA_FORTE
+    if pct >= 70:
+        return LARANJA
+    return AMBAR
+
+
+# ----------------------------------------------------------------- logo ---
+#
+# O simbolo do MAGI, tirado da arte de referencia. Duas decisoes explicam
+# por que esta versao parece a referencia e as anteriores nao:
+#
+# Braille (U+2800) carrega 2x4 subpixels por celula, contra 1x2 do
+# meio-bloco e 2x2 do quadrante. E a celula certa pra line-art — a mesma
+# que drawille e plotext usam pra grafico de linha. Com meio-bloco o traco
+# fino nao cabe e o desenho vira degrau.
+#
+# E o que vai na tela e o CONTORNO, nao o preenchimento. A tentativa
+# anterior enchia as faixas pra elas sobreviverem a reducao, e a marca
+# virava um bloco solido — o oposto da referencia, que e traco fino.
+#
+# Os arcos concentricos entram como camada de tras, em verde apagado: sao
+# boa parte da atmosfera do original. Celula vazia da marca e espaco comum,
+# entao o arco aparece por baixo.
+#
+# Na arte os arcos cobrem so a metade de cima — e uma cupula, nao um
+# circulo. O gerador mede o centro e os raios dos aneis existentes e fecha
+# as circunferencias nesses mesmos raios, entao o traco irregular do
+# original fica onde ele existe e o resto do circulo vem desenhado.
+#
+# Pra regerar a partir da arte, veja ferramentas/gerar_logo.py — o Pillow
+# fica la, aqui o desenho ja vem pronto.
+
+LOGO_GRANDE = (   # 52 colunas x 26 linhas
+    '',
+    '',
+    '',
+    '',
+    '             ⠰⣶⠶⠶⠶⣶⣶⡶⠶⠶⣆',
+    '              ⠙⣦⣤⣾⠟⠋ ⢀⣤⣿⣦',
+    '               ⠘⢯⠁⢀⣠⣾⡿⠋⠁⢘⣧',
+    '                ⠈⢷⡿⠟⠁ ⣠⣴⡿⠟⢷⡀',
+    '                 ⠈⢷⣀⣤⣾⠟⠋   ⢳⡀',
+    '                   ⠹⡏⠁    ⢀⣤⣿⣄',
+    '                    ⢹   ⣠⡶⠋⠁⢹⠹⣆',
+    '                    ⣸⢀⡴⠟⠁   ⢸⡄⠉⠉⠉⠉⣿⡉⠉⢹⣿⠉⠉⣿⡏⠉⣩⠏',
+    '                   ⣼⣟⡋      ⠈⡇    ⢿⡇ ⠘⣿  ⢸⣧⣰⠏',
+    '                 ⢀⡼⠁⠈⠙⠓⠦⣤⣀   ⢷    ⢸⣇  ⣿⡆ ⢸⣽⠃',
+    '                ⢀⡾⠁      ⠈⠙⠓⠦⣼    ⢸⣿  ⢻⡇ ⡼⠁',
+    '               ⢠⡞⠿⣶⣦⣤⣀  ⢠⡞⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠁',
+    '              ⢠⣯⣀⡀ ⠈⠉⠛⠿⣷⠟',
+    '             ⠰⡏⠉⠛⠻⢷⣶⣤⣄⣰⠏',
+    '              ⠹⣦⣄⣀  ⠉⣿⠋',
+    '               ⠙⣿⠛⠿⣶⡾⠃',
+    '                ⠘⢧⢀⡾⠁',
+    '                 ⠈⠟',
+    '',
+    '',
+    '',
+    '',
+)
+
+ARCOS_GRANDE = (   # fundo do LOGO_GRANDE, mesma grade
+    '                 ⢀⣀⡤⣤⣖⡲⠶⠶⠶⠶⠶⠶⢶⣒⣤⡤⣄⣀',
+    '             ⣀⣤⣲⠿⠓⠋⠉ ⣀⣀⣀⣠⣤⣤⣄⣀⣀⣀ ⠉⠉⠚⠯⣗⡦⣀',
+    '          ⣠⣴⡿⠛⠉⣀⣠⣴⠶⠛⠚⢉⣉⣉⣤⣤⣤⣤⣉⣉⣉⠛⠛⠶⢦⣄⣀⠉⠛⠿⣶⣄',
+    '        ⡠⣾⠟⠁⣀⣴⠾⠋⣁⣤⡶⠟⠛⢉⢉⣉⣀⣀⣀⣀⣉⣉⡉⠛⠿⢶⣤⣈⠙⠷⣦⣀⠈⠻⢽⣦⡀',
+    '      ⣠⣮⠊ ⣠⡾⠋⣡⡴⠛⠉⣁⡤⠖⠛⠋⠉⢉⣁⣤⣤⣈⣉⣉⠙⠛⠶⢦⣌⡉⠻⢶⣌⠙⢷⣄ ⠙⢿⢦',
+    '    ⢀⣾⠟⠁⣠⡾⢋⣴⡾⢋⣠⡴⠊⠁⣀⠤⠖⠚⠉⠉⢉⣉⣉⣉⣉⣉⠛⠳⢶⣤⣉⠛⢷⣄⡙⠷⣦⡙⢷⡄ ⠳⣷⡄',
+    '   ⢠⣿⠋⢀⣼⠏⣠⡾⢃⣴⠟⠉⣠⠴⠋⢁⣠⠴⠒⠋⠉⠉⣈⣉⣉⡉⠙⠛⠷⣦⣌⠙⠷⣦⡈⠻⣦⡈⢷⣄⠙⣆ ⠘⢟⣆',
+    '  ⢠⣻⠃⢠⡾⠃⣼⠏⣠⡾⠁⣠⠞⢁⣴⠖⠉⣀⡤⠖⠋⠉⣉⣀⣀⣉⣉⠙⠓⢶⣤⡉⠻⣦⡈⠻⣦⡈⢿⣄⠹⣧⠈⢧ ⠈⢿⣆',
+    ' ⣤⣿⠃⢀⣾⠁⣼⠃⣰⡟⢠⡴⠃⣴⠟⢁⣴⠚⢁⣠⠔⠚⠉⢁⣀⣀⣈⠙⠛⠷⣦⣈⠻⣦⡈⠻⣦⠘⢷⡄⢻⣆⠘⣧ ⢧ ⠈⣟⡄',
+    '⢠⣿⡏ ⣼⠃⣼⠇⢰⡏⢠⡿⢁⣾⠃⣴⠟⢡⡶⠋⢀⡴⠚⠉⠁  ⠈⠉⠻⢶⣌⠙⢷⡌⠻⣦⠘⣷⡈⢻⡄⢹⣆⠹⣇⠈⡇ ⠸⣽',
+    '⣼⣿ ⢠⡟ ⡏⢀⡿ ⣾⠁⣾⠃⣼⠏⣰⡟⢡⡾⠋          ⠙⢷⡌⢻⡆⠹⣇⠘⣷⠈⣿ ⢿⡀⢿⡆⢸⡀ ⢯⡇',
+    '⢻⡏ ⢸⠇⢸⠁⢸⡇⢸⡇⢸⡏⢠⡟⢠⡿⢀⡿⠁             ⢹⡀⠹⡄⢸⡀⠸⡄⠸⡄ ⡇⠰⣇⠸⣇ ⢸⢧',
+    '⢸⡇ ⣾⢀⢸⢀⢸⢀⣼⢃⢸⢃⢸⣇⢸⢇⢸⡇               ⡇ ⡇ ⡇ ⡇ ⡇ ⣷ ⣿ ⣿ ⢸⢸',
+    '⢸⡇ ⢻ ⢸ ⢸⠘⢹⡜⢸⡜⢸⡟⢸⡞⢸⡁               ⡇ ⡇ ⡇ ⡇ ⡇ ⡿ ⣿ ⣿ ⢸⢸',
+    '⣼⣇ ⠘⡆⢸ ⠸⡄⠘⡇⢸⡇⠘⣇⠘⢇ ⢧              ⣰⠁⢰⠃⢰⠃⢰⠃⢰⡇⢘⡇⢠⡏⢰⡏ ⢸⡞',
+    '⢻⣿  ⢇ ⡇ ⢧ ⢹⡀⠹⡀⠹⡄⠘⣆⠈⢧⡀          ⢀⡴⠃⣠⠇⢀⠏⢀⡞ ⣾ ⢸⠁⣼⠇⣸⠇ ⣞⡇',
+    '⠘⣿⣇ ⠸⡄⠸⡄⠘⡆ ⢧ ⠹⡄⠙⢄⠈⠣⣀⠉⠢⣄⣀    ⢀⣠⠴⠋⢀⡴⠁⣠⠏⢀⡞ ⣼⠃⢠⠇⢰⡏⢠⡿ ⢠⣻',
+    ' ⠛⡿⡄ ⢳⡀⠱⡀⠘⣆⠈⢳⡀⠙⢦⠈⠳⣄⠈⠓⠦⣄⡈⠉⠉⠉⠉⢁⣀⠤⠞⠁⣠⠞⠁⣠⠏⢀⡼⠃⢰⠎⢠⡟ ⡾⠁⢀⣾⠇',
+    '  ⠹⡽⡄ ⠳⡀⠱⡄⠘⢦⡀⠙⢦⡈⠑⢦⡈⠙⠲⢤⣀⣉⠉⠉⠉⠉⢉⣀⡤⠔⠋⢁⡤⠞⠁⣠⠎ ⡰⠋⢀⡞⢀⡜⠁⢀⣞⡞',
+    '   ⠘⣿⡄ ⠙⣄⠘⢦⡀⠙⢄⡀⠙⠦⣀⠈⠓⠢⢄⣀⡈⠉⠉⠉⠉⢉⣀⣠⠴⠚⠉⣀⡴⠊⠁⣠⠞⠁⡰⠋⢠⠞ ⢀⣾⠏',
+    '    ⠘⢿⣦⡀⠈⠣⣄⠙⢦⡀⠙⠦⣄⠈⠙⠲⠤⣄⣀⡉⠉⠉⠉⠉⢉⣀⣀⠤⠖⠚⠁⣀⡴⠊⢁⡠⠞⢁⡴⠋ ⣠⡻⠋',
+    '      ⠳⣷⣄ ⠈⠢⣄⠙⠲⣄⡀⠙⠲⠤⣄⣀ ⠉⠉⠉⠉⠉⠉ ⣀⣀⠤⠖⠊⠁⣠⠴⠋⣀⡴⠋ ⣠⣾⠟⠁',
+    '       ⠈⠻⣗⢤⡀⠈⠙⠦⣄⠉⠓⠦⢤⣀⡀⠉⠉⠉⠉⠉⠉⠉⠉⢁⣀⡤⠴⠚⠉⣀⠴⠚⠁ ⣠⣾⠟⠁',
+    '          ⠙⠿⣶⢄⡀ ⠉⠓⠦⠤⣀⣉⡉⠉⠙⠒⠒⠚⠉⠉⣉⣀⡤⠴⠒⠋⠁⢀⣠⣴⡿⠊⠁',
+    '            ⠈⠙⠻⢷⣦⢤⣀⡀  ⠉⠉⠉⠉⠉⠉⠉⠉⠁  ⣀⣠⣴⣺⠽⠋⠁',
+    '                 ⠉⠓⠛⠯⠷⠶⣖⣒⣒⣒⣒⣲⠶⠾⠽⠛⠚⠉⠁',
+)
+
+LOGO_PEQUENO = (   # 24 colunas x 13 linhas
+    ' ⣤⠤⠤⢤⣤⠤⢤',
+    ' ⠈⢧⡾⠋⠁⣠⡾⢳⡀',
+    '  ⠈⢧⡴⠟⠁⣀⡴⢷⡀',
+    '   ⠈⢳⣤⠾⠋  ⠹⡄',
+    '     ⢳⡀ ⢀⡤⠞⡿⣄',
+    '     ⣰⣣⠴⠋  ⢳⠈⠉⠉⣿⠉⢹⡍⠉⣏⠉⡽',
+    '    ⣰⠛⠧⣄⡀  ⢸   ⢻ ⠸⡇ ⣿⡞⠁',
+    '   ⣰⠃   ⠉⠙⣲⣼⣄⣀⣀⣸⣀⣀⣧⣀⡞',
+    '  ⡼⠙⠓⠶⣤⣀⣰⠋⠁',
+    ' ⣼⠛⠲⢤⣄⡀⣸⠃',
+    ' ⠘⣦⣤⣀⠈⡽⠁',
+    '  ⠈⢧⢉⡟⠁',
+    '   ⠈⠛',
+)
+
+
+def _logo(marca, arcos=()):
+    """Compoe as duas camadas: a marca por cima, o arco onde ela nao pinta."""
+    linhas = []
+    for i in range(max(len(marca), len(arcos))):
+        m = marca[i] if i < len(marca) else ''
+        a = arcos[i] if i < len(arcos) else ''
+        t = Text()
+        for j in range(max(len(m), len(a))):
+            cm = m[j] if j < len(m) else ' '
+            ca = a[j] if j < len(a) else ' '
+            if cm != ' ':
+                t.append(cm, style=LARANJA)
+            elif ca != ' ':
+                t.append(ca, style=VERDE_ARCO)
+            else:
+                t.append(' ')
+        linhas.append(t)
+    return Group(*linhas)
+
+
+def emblema_grande():
+    """O simbolo com os arcos concentricos, pra tela de boot."""
+    return _logo(LOGO_GRANDE, ARCOS_GRANDE)
+
+
+def emblema():
+    """So a marca, reduzida, pro canto da aba GERAL: nesse tamanho os arcos
+    viram sujeira em vez de atmosfera."""
+    return _logo(LOGO_PEQUENO)
+
+
+# ------------------------------------------------------ painel do MAGI ---
+#
+# O diagrama da aba DIAGRAMA, no estilo da tela do MAGI: tres blocos
+# preenchidos com o nome vazado em preto, cantos chanfrados apontando pro
+# centro, e MAGI no meio. A cor do bloco e o estado da unidade, entao a tela
+# inteira muda de cor junto — que e o efeito do "ALL GREEN" do original.
+#
+# O chanfro usa bloco de tres quadrantes e nao triangulo geometrico: o
+# triangulo nao preenche a celula na maioria das fontes e a diagonal sai
+# pontilhada, enquanto o quadrante fecha solido.
+
+CHANFRO = {'tl': '\u259f', 'tr': '\u2599', 'bl': '\u259c', 'br': '\u259b'}
+
+
+def _tela(largura, altura):
+    """Grade de caracteres com cor de frente e de fundo por celula."""
+    return ([[' '] * largura for _ in range(altura)],
+            [[None] * largura for _ in range(altura)],
+            [[None] * largura for _ in range(altura)])
+
+
+def _bloco(tela, r0, c0, largura, altura, linhas, cor, cortes=(), passo=1):
+    """Bloco preenchido com o texto vazado, cantos chanfrados.
+
+    `passo` e quantas colunas o chanfro anda por linha. Com 1 a escada sai
+    continua, um degrau por linha; com 2 o degrau fica com duas colunas e
+    o corte parece grosseiro, porque o bisel ocupa so a primeira delas.
+    """
+    g, fg, bg = tela
+    k = dict(cortes)
+    tl, tr = k.get('tl', 0), k.get('tr', 0)
+    bl, br = k.get('bl', 0), k.get('br', 0)
+
+    for i in range(altura):
+        for j in range(largura):
+            diag, vazio = None, False
+            de_baixo = altura - 1 - i
+            # corte = quantas colunas somem nesta linha. Zero significa
+            # linha cheia: pintar o bisel ai deixava uma lasca solta na
+            # borda, que era o que fazia o bloco parecer serrilhado.
+            for lado, ativo, corte in (
+                    ('tl', i < tl, (tl - 1 - i) * passo),
+                    ('bl', de_baixo < bl, (bl - 1 - de_baixo) * passo),
+                    ('tr', i < tr, (tr - 1 - i) * passo),
+                    ('br', de_baixo < br, (br - 1 - de_baixo) * passo)):
+                if not ativo or corte <= 0:
+                    continue
+                if lado in ('tl', 'bl'):
+                    if j < corte:
+                        vazio = True
+                    elif j == corte:
+                        diag = CHANFRO[lado]
+                else:
+                    lim = largura - 1 - corte
+                    if j > lim:
+                        vazio = True
+                    elif j == lim:
+                        diag = CHANFRO[lado]
+
+            r, c = r0 + i, c0 + j
+            if diag:
+                g[r][c], fg[r][c] = diag, cor
+            elif not vazio:
+                g[r][c], bg[r][c] = ' ', cor
+
+    # o texto centraliza no trecho que a linha realmente tem preenchido, e
+    # nao no retangulo nominal: nas linhas chanfradas o bloco e mais
+    # estreito, e centralizar pelo nominal joga a frase por cima do bisel
+    # escolhe a altura do texto onde o bloco e mais largo, em vez de
+    # centralizar sempre: com chanfro em cima o texto desce, com chanfro
+    # embaixo ele sobe, e nenhuma linha fica espremida contra o bisel
+    def vao_em(linha):
+        cheias = [j for j in range(largura) if bg[linha][c0 + j] == cor]
+        return (cheias[-1] - cheias[0] + 1) if cheias else 0
+
+    meio = max(0, (altura - len(linhas)) // 2)
+    opcoes = range(0, altura - len(linhas) + 1) if altura >= len(linhas) else [0]
+    topo = r0 + max(opcoes, key=lambda o: (
+        min(vao_em(r0 + o + n) for n in range(len(linhas))), -abs(o - meio)))
+
+    for n_linha, texto in enumerate(linhas):
+        linha = topo + n_linha
+        cheias = [c0 + j for j in range(largura) if bg[linha][c0 + j] == cor]
+        if not cheias:
+            continue
+        esq, dir_ = cheias[0], cheias[-1]
+        vao = dir_ - esq + 1
+        texto = texto[:vao]
+        ini = esq + (vao - len(texto)) // 2
+        for n, ch in enumerate(texto):
+            g[linha][ini + n] = ch
+            fg[linha][ini + n] = PRETO
+
+
+def _liga_blocos(tela, r, c, comp, cor, vertical=False):
+    g, _fg, bg = tela
+    for i in range(comp):
+        rr, cc = (r + i, c) if vertical else (r, c + i)
+        g[rr][cc], bg[rr][cc] = ' ', cor
+
+
+def _rotulo(tela, r, c, texto, cor):
+    # limpa o fundo tambem: sem isso o texto cai por cima de uma ligacao e
+    # sai laranja sobre laranja, ou seja, invisivel
+    g, fg, bg = tela
+    for i, ch in enumerate(texto):
+        g[r][c + i], fg[r][c + i], bg[r][c + i] = ch, cor, None
+
+
+def _desenha_tela(tela):
+    g, fg, bg = tela
+    linhas = []
+    for r in range(len(g)):
+        t = Text()
+        for c in range(len(g[0])):
+            estilo = fg[r][c] or ''
+            if bg[r][c]:
+                estilo = ('%s on %s' % (estilo, bg[r][c])).strip()
+            t.append(g[r][c], style=estilo or None)
+        linhas.append(t)
+    return Group(*linhas)
+
+
+def _ficha_unidade(u):
+    """As tres linhas que vao dentro do bloco: quem e, o que esta pegando,
+    e o que carrega. A segunda linha e o gargalo — o recurso mais apertado
+    e o quanto ele esta — pra tela dizer o que esta causando o problema, e
+    nao so que ha um."""
+    if not u.online:
+        return [u.rotulo, 'SEM RESPOSTA', u.ip]
+    estado = u.estado[0]
+    recurso, valor = gargalo(u)
+    tenants = sum(1 for c in u.containers if _e_tenant(c))
+    return [u.rotulo,
+            '%s \u00b7 %s %.0f%%' % (estado, recurso, valor),
+            '%d ctn \u00b7 %d ten \u00b7 %s' % (len(u.containers), tenants,
+                                            dur_h(u.uptime))]
+
+
+def painel_unidades(unidades):
+    """As tres unidades em triangulo em volta do centro, no estilo da tela
+    do MAGI: bloco preenchido, texto vazado, chanfro apontando pro meio."""
+    por_nome = {u.nome: u for u in unidades}
+
+    def peca(nome):
+        u = por_nome.get(nome)
+        if u is None:
+            return [nome, '-', '-'], FOSCO
+        return _ficha_unidade(u), u.estado[1]
+
+    # a tela tem a largura exata do desenho, senao Align.center centraliza
+    # a moldura e o conjunto fica deslocado dentro dela
+    tela = _tela(64, 16)
+
+    linhas, cor = peca('BALTHASAR')
+    _bloco(tela, 0, 17, 30, 6, linhas, cor, cortes=(('bl', 4), ('br', 4)))
+    linhas, cor = peca('CASPER')
+    _bloco(tela, 9, 0, 30, 7, linhas, cor, cortes=(('tr', 5),))
+    linhas, cor = peca('MELCHIOR')
+    _bloco(tela, 9, 34, 30, 7, linhas, cor, cortes=(('tl', 5),))
+
+    # as barras encostam onde o chanfro de fato comeca, nao na borda nominal
+    _liga_blocos(tela, 6, 29, 6, LARANJA)      # base de BALTHASAR ao centro
+    _liga_blocos(tela, 8, 24, 4, LARANJA)      # CASPER ao centro
+    _liga_blocos(tela, 8, 36, 4, LARANJA)      # centro a MELCHIOR
+    _rotulo(tela, 7, 28, 'M A G I', LARANJA_FORTE)
+    return _desenha_tela(tela)
+
+
+def barra(pct, largura=18):
+    pct = max(0.0, min(100.0, pct))
+    cheio = int(round(pct / 100 * largura))
+    cor = cor_por_valor(pct)
+    t = Text()
+    t.append('█' * cheio, style=cor)
+    t.append('░' * (largura - cheio), style=FOSCO)
+    return t
+
+
+def faisca(valores, largura=28, cor=AMBAR, teto=None):
+    """Grafico de linha em blocos.
+
+    teto=100 desenha em escala absoluta, entao 30% aparece como bloco baixo.
+    teto=None escala pelo proprio pico, para grandezas sem limite natural (IO).
+    Sem escala absoluta, um valor estavel virava barra cheia e parecia 100%.
+
+    Duas correcoes em cima disso: (1) com teto fixo e utilizacao baixa (CPU a
+    1%, por exemplo), o arredondamento linear jogava tudo pro nivel 0, que e
+    espaco em branco — o grafico sumia. Por isso usa raiz quadrada quando ha
+    teto absoluto: comprime a escala pra utilizacao baixa ainda aparecer, sem
+    fingir que esta alta. (2) sem teto, uma folga de 30% sobre o pico evita
+    que a linha fique sempre "no talo" (virando uma barra solida comprida).
+    Em ambos os casos, valor > 0 nunca renderiza como bloco vazio.
+    """
+    if not valores:
+        return Text('░' * largura, style=FOSCO)
+    dados = list(valores)[-largura:]
+    comprime = teto is not None
+    escala = float(teto) if teto else (max(dados) or 1.0) * 1.3
+    if escala <= 0:
+        escala = 1.0
+    t = Text()
+    if len(dados) < largura:
+        t.append('░' * (largura - len(dados)), style=FOSCO)
+    for v in dados:
+        if v <= 0:
+            idx = 0
+        else:
+            frac = min(1.0, v / escala)
+            if comprime:
+                frac = frac ** 0.5
+            idx = max(1, min(8, round(frac * 8)))
+        t.append(BLOCOS[idx], style=cor)
+    return t
+
+
+def linha_metrica(rotulo, valor_txt, pct, spark=None, largura_barra=16):
+    t = Text()
+    t.append('%-5s ' % rotulo, style=FOSCO)
+    t.append_text(barra(pct, largura_barra))
+    t.append(' %7s' % valor_txt, style=cor_por_valor(pct))
+    if spark is not None:
+        t.append('  ')
+        t.append_text(spark)
+    return t
+
+
+# ---------------------------------------------------------------- desenho ---
+
+
+def painel_unidade(u, larg_barra=12, larg_g=24):
+    with u.lock:
+        estado, cor_estado = u.estado
+        linhas = []
+        cab = Text()
+        cab.append('%s ' % u.rotulo, style='bold %s' % AMBAR)
+        cab.append('・ ', style=FOSCO)
+        cab.append(estado, style='bold %s' % cor_estado)
+        linhas.append(cab)
+        sub = Text()
+        sub.append(u.papel, style=FOSCO)
+        linhas.append(sub)
+        linhas.append(Text(''))
+
+        if not u.online:
+            linhas.append(Text('  SEM RESPOSTA  %s' % u.erro, style=VERMELHO))
+            linhas.append(Text('  %s' % u.ip, style=FOSCO))
+            return Panel(Group(*linhas), border_style=VERMELHO,
+                         title='[%s]OFFLINE[/]' % VERMELHO, padding=(0, 1))
+
+        # mostradores: barra e valor, sem grafico grudado, para caber e nao apertar
+        linhas.append(linha_metrica('CPU', '%5.1f%%' % u.cpu, u.cpu, None, larg_barra))
+        linhas.append(linha_metrica('MEM', '%5.1f%%' % u.mem_pct, u.mem_pct, None, larg_barra))
+        linhas.append(linha_metrica('DSK', '%5.1f%%' % u.disco_pct, u.disco_pct, None, larg_barra))
+        linhas.append(Text(''))
+
+        # graficos em escala ABSOLUTA de 0 a 100%: valor estavel fica baixo,
+        # e nao cheio como acontecia quando a escala era o proprio pico
+        g = Text()
+        g.append('cpu   ', style=FOSCO)
+        g.append_text(faisca(u.hist_cpu, larg_g, cor_por_valor(u.cpu), teto=100))
+        linhas.append(g)
+        g = Text()
+        g.append('mem   ', style=FOSCO)
+        g.append_text(faisca(u.hist_mem, larg_g, cor_por_valor(u.mem_pct), teto=100))
+        linhas.append(g)
+        g = Text()
+        pico_io = max(u.hist_io) if u.hist_io else 0.0
+        g.append('io    ', style=FOSCO)
+        g.append_text(faisca(u.hist_io, larg_g, LARANJA))
+        linhas.append(g)
+        esc = Text()
+        # rotulo curto de proposito: com "io pico" a linha passa de 30
+        # colunas quando o pico tem tres digitos, e quebra no painel de tres
+        esc.append('      0-100%%  pico %s/s' % bytes_h(pico_io), style=FOSCO)
+        linhas.append(esc)
+        linhas.append(Text(''))
+
+        det = Text()
+        det.append('  mem  ', style=FOSCO)
+        det.append('%s / %s' % (bytes_h(u.mem_usada), bytes_h(u.mem_total)),
+                   style=AMBAR)
+        linhas.append(det)
+        det = Text()
+        det.append('  dsk  ', style=FOSCO)
+        det.append('%s / %s' % (bytes_h(u.disco_usado), bytes_h(u.disco_total)),
+                   style=AMBAR)
+        linhas.append(det)
+        det = Text()
+        det.append('  net  ', style=FOSCO)
+        det.append('↓%s/s ' % bytes_h(u.net_rx), style=CIANO)
+        det.append('↑%s/s' % bytes_h(u.net_tx), style=CIANO)
+        linhas.append(det)
+        det = Text()
+        det.append('  io   ', style=FOSCO)
+        det.append('r %s/s ' % bytes_h(u.io_leitura), style=LARANJA)
+        det.append('w %s/s' % bytes_h(u.io_escrita), style=LARANJA)
+        linhas.append(det)
+        det = Text()
+        det.append('  load ', style=FOSCO)
+        det.append('%.2f %.2f %.2f' % u.load, style=AMBAR)
+        det.append('  (%d cpu)' % u.ncpu, style=FOSCO)
+        linhas.append(det)
+        det = Text()
+        det.append('  up   ', style=FOSCO)
+        det.append(dur_h(u.uptime), style=AMBAR)
+        det.append('   ctn ', style=FOSCO)
+        det.append(str(len(u.containers)), style=AMBAR)
+        linhas.append(det)
+
+    return Panel(Group(*linhas), border_style=cor_estado,
+                 title='[%s]%s[/]' % (cor_estado, u.ip), title_align='right',
+                 padding=(0, 1))
+
+
+TETO_MEM = 0.85   # acima disso a unidade e tratada como sem folga de memoria
+
+
+def _media(seq):
+    seq = list(seq)
+    return (sum(seq) / len(seq)) if seq else None
+
+
+def cpu_estavel(u):
+    """CPU pela media do historico, nao pela amostra do segundo: a leitura
+    instantanea oscila demais e faria o veredito trocar de unidade a cada
+    quadro, o que nao serve pra decidir nada."""
+    med = _media(u.hist_cpu)
+    return u.cpu if med is None else med
+
+
+def gargalo(u):
+    """Recurso mais apertado da unidade, e quanto ele esta. E ele que
+    limita o que ainda cabe ali, entao e por ele que a unidade e julgada."""
+    return max((('cpu', cpu_estavel(u)), ('mem', u.mem_pct), ('dsk', u.disco_pct)),
+               key=lambda par: par[1])
+
+
+def pegada_tenant(unidades):
+    """Memoria media de um tenant, medida pelos que ja rodam no cluster.
+
+    E estimativa, nao medida de um tenant especifico: serve pra dar ordem
+    de grandeza de quantos ainda cabem. Retorna None quando nao ha tenant
+    nenhum reportado pra servir de base.
+    """
+    mems = [c['mem'] for u in unidades for c in u.containers
+            if _e_tenant(c) and c['mem'] > 0]
+    return (sum(mems) / len(mems)) if mems else None
+
+
+def cabem_tenants(u, pegada):
+    """Quantos tenants ainda cabem na unidade pela memoria, respeitando o
+    teto de seguranca. So considera memoria — disco e CPU entram no
+    veredito pela via do gargalo()."""
+    if not pegada or not u.mem_total:
+        return None
+    folga = u.mem_total * TETO_MEM - u.mem_usada
+    return max(0, int(folga // pegada))
+
+
+def aba_geral(unidades):
+    tab = Table.grid(expand=True, padding=(0, 1))
+    for _ in unidades:
+        tab.add_column(ratio=1)
+    tab.add_row(*[painel_unidade(u) for u in unidades])
+
+    vivos = [u for u in unidades if u.online]
+    online = len(vivos)
+    cpu_med = sum(u.cpu for u in vivos) / max(1, online)
+    ctn = sum(len(u.containers) for u in unidades)
+
+    # topo: logo a esquerda, ficha do sistema a direita, para nao gastar altura
+    topo = Table.grid(expand=True, padding=(0, 2))
+    topo.add_column(width=26)   # o logo tem 24 colunas; o resto e respiro
+    topo.add_column(ratio=1)
+
+    ficha = []
+    f = Text()
+    f.append('SISTEMA MAGI', style='bold %s' % LARANJA)
+    f.append('   マギ システム', style=FOSCO)
+    ficha.append(f)
+    ficha.append(Text(''))
+    f = Text()
+    f.append('unidades   ', style=FOSCO)
+    f.append('%d de %d respondendo' % (online, len(unidades)),
+             style='bold %s' % (VERDE if online == len(unidades) else VERMELHO))
+    ficha.append(f)
+    f = Text()
+    f.append('carga      ', style=FOSCO)
+    f.append('%.1f%% em media' % cpu_med, style=cor_por_valor(cpu_med))
+    ficha.append(f)
+    f = Text()
+    f.append('containers ', style=FOSCO)
+    f.append(str(ctn), style=AMBAR)
+    f.append('   tenants ', style=FOSCO)
+    f.append(str(sum(1 for u in unidades for c in u.containers
+                     if _e_tenant(c))), style=AMBAR)
+    ficha.append(f)
+    # quem carrega o cluster hoje
+    f = Text()
+    f.append('concentra  ', style=FOSCO)
+    if vivos and ctn:
+        mais = max(vivos, key=lambda u: len(u.containers))
+        n = len(mais.containers)
+        f.append(mais.rotulo, style='bold %s' % AMBAR)
+        f.append(' · %d de %d containers (%.0f%%)' % (n, ctn, n / ctn * 100),
+                 style=FOSCO)
+    else:
+        f.append('sem containers reportados', style=FOSCO)
+    ficha.append(f)
+
+    # o que estoura primeiro
+    f = Text()
+    f.append('risco      ', style=FOSCO)
+    if not vivos:
+        f.append('todas as unidades fora do ar', style='bold %s' % VERMELHO)
+    else:
+        pior = max(vivos, key=lambda u: gargalo(u)[1])
+        rec, val = gargalo(pior)
+        if val >= 80:
+            f.append(pior.rotulo, style='bold %s' % AMBAR)
+            f.append(' · %s %.0f%%' % (rec, val), style=LARANJA)
+            f.append(', nao comporta novo tenant' if val >= 90
+                     else ', perto do limite', style=FOSCO)
+        else:
+            f.append('nenhuma unidade perto do limite', style=VERDE)
+    ficha.append(f)
+
+    # onde cabe o proximo tenant
+    f = Text()
+    f.append('veredito   ', style=FOSCO)
+    if not vivos:
+        f.append('SISTEMA INOPERANTE', style='bold %s' % VERMELHO)
+    else:
+        apta = min(vivos, key=lambda u: gargalo(u)[1])
+        rec, val = gargalo(apta)
+        cabem = cabem_tenants(apta, pegada_tenant(unidades))
+        if val >= 90:
+            f.append('NENHUMA UNIDADE COM FOLGA', style='bold %s' % LARANJA)
+        else:
+            f.append(apta.rotulo, style='bold %s' % VERDE)
+            if cabem is None:
+                f.append(' apta · limite %s %.0f%%' % (rec, val), style=FOSCO)
+            elif cabem == 0:
+                f.append(' apta, mas sem folga de memoria', style=FOSCO)
+            elif rec != 'mem' and val >= 70:
+                # a conta e por memoria; se o aperto vem de outro recurso,
+                # dizer so "cabem N" enganaria
+                f.append(' apta · ~%d pela mem, %s ja em %.0f%%'
+                         % (cabem, rec, val), style=FOSCO)
+            else:
+                f.append(' apta · cabem ~%d tenants pela memoria' % cabem,
+                         style=FOSCO)
+    ficha.append(f)
+
+    topo.add_row(emblema(), Group(*ficha))
+
+    return Group(Panel(topo, border_style=FOSCO, padding=(0, 1)), Text(''), tab)
+
+
+def aba_unidade(u):
+    # grafico do mesmo tamanho das barras de CPU/MEM/DSK acima, em vez de
+    # esticar pra quase a largura toda do terminal
+    larg_barra = 28
+    larg_g = larg_barra
+
+    # painel_unidade pega o lock por conta propria; threading.Lock nao e
+    # reentrante, entao nao da para chamar aqui de dentro de um "with u.lock".
+    cabecalho = painel_unidade(u, larg_barra=larg_barra, larg_g=larg_g)
+    with u.lock:
+        containers = list(u.containers)
+        online = u.online
+
+    tab = Table(expand=True, border_style=FOSCO, header_style='bold %s' % LARANJA,
+                title_style='bold %s' % AMBAR)
+    tab.add_column('CONTAINER', style=AMBAR, no_wrap=True)
+    tab.add_column('CPU%', justify='right', width=8)
+    tab.add_column('MEM', justify='right', width=10)
+    tab.add_column('USO', justify='left', width=14)
+    tab.add_column('RX/s', justify='right', width=10)
+    tab.add_column('TX/s', justify='right', width=10)
+
+    if not containers:
+        tab.add_row('sem dados do Prometheus' if online else 'unidade offline',
+                    '-', '-', '', '-', '-')
+    else:
+        pico = max((c['mem'] for c in containers), default=1) or 1
+        for c in containers:
+            pct_cpu = c['cpu']
+            tab.add_row(
+                c['nome'],
+                Text('%.1f' % pct_cpu, style=cor_por_valor(pct_cpu)),
+                Text(bytes_h(c['mem']), style=AMBAR),
+                barra(c['mem'] / pico * 100, 12),
+                Text(bytes_h(c['rx']) if c['rx'] else '-', style=CIANO),
+                Text(bytes_h(c['tx']) if c['tx'] else '-', style=CIANO),
+            )
+    return Group(cabecalho, Text(''), tab)
+
+
+def cor_latencia(ms):
+    if ms is None:
+        return VERMELHO
+    if ms < 50:
+        return VERDE
+    if ms < 150:
+        return AMBAR
+    return LARANJA
+
+
+def tabela_latencia(unidades):
+    """Latencia real (handshake TCP) desta maquina ate cada unidade pela
+    tailnet, com historico em faisca. Substitui a antiga tabela de deriva
+    de relogio entre nos, que nao dizia nada de util na pratica."""
+    tab = Table(expand=True, border_style=FOSCO, header_style='bold %s' % LARANJA,
+                title='latencia ate cada unidade (tailnet)', title_style=FOSCO,
+                title_justify='left')
+    tab.add_column('UNIDADE', style='bold %s' % AMBAR)
+    tab.add_column('PING', justify='right')
+    tab.add_column('HISTORICO', justify='left')
+    tab.add_column('MIN', justify='right')
+    tab.add_column('MAX', justify='right')
+
+    for u in unidades:
+        hist = list(u.hist_latencia)
+        if u.latencia_ms is None:
+            tab.add_row(u.rotulo, Text('sem resposta', style=VERMELHO),
+                        faisca(hist, 22, VERMELHO), '-', '-')
+            continue
+        cor = cor_latencia(u.latencia_ms)
+        tab.add_row(
+            u.rotulo,
+            Text('%.0fms' % u.latencia_ms, style=cor),
+            faisca(hist, 22, cor),
+            '%.0fms' % min(hist, default=u.latencia_ms),
+            '%.0fms' % max(hist, default=u.latencia_ms),
+        )
+    return tab
+
+
+def aba_diagrama(unidades):
+    """Diagrama triangular das tres unidades, no estilo da tela do MAGI
+    quando o sistema e atacado no anime: cada no e o seu proprio selo, sem
+    fingir um voto agregado que o cluster ainda nao tem condicao de emitir.
+    Abaixo, dados reais: metricas por unidade e a latencia de verdade desta
+    maquina ate cada uma pela tailnet."""
+    titulo = Text('DIAGRAMA DE DISPONIBILIDADE', style='bold %s' % LARANJA)
+
+    linhas = [titulo, Text('')]
+    linhas.append(Align.center(painel_unidades(unidades)))
+    linhas.append(Text(''))
+    linhas.append(tabela_latencia(unidades))
+
+    return Panel(Group(*linhas), border_style=FOSCO, padding=(1, 2))
+
+
+def cabecalho(aba, unidades):
+    t = Table.grid(expand=True)
+    t.add_column(justify='left', ratio=1)
+    t.add_column(justify='center', ratio=2)
+    t.add_column(justify='right', ratio=1)
+
+    esq = Text()
+    esq.append('MAGI', style='bold %s' % LARANJA)
+    esq.append(' SYSTEM', style=AMBAR)
+    esq.append('  マギ', style=FOSCO)
+
+    meio = Text()
+    nomes = ['GERAL'] + [u.nome for u in unidades] + ['DIAGRAMA']
+    for i, nome in enumerate(nomes):
+        if i == aba:
+            meio.append(' %d %s ' % (i + 1, nome), style='bold black on %s' % AMBAR)
+        else:
+            meio.append(' %d %s ' % (i + 1, nome), style=FOSCO)
+        meio.append(' ')
+
+    dir_ = Text()
+    dir_.append(time.strftime('%d/%m %H:%M:%S'), style=AMBAR)
+    t.add_row(esq, meio, dir_)
+    return Panel(t, border_style=LARANJA, padding=(0, 1))
+
+
+def rodape():
+    t = Text()
+    for tecla, desc in (('1-5', 'abas'), ('TAB', 'ciclar'), ('r', 'atualizar'),
+                        ('q', 'sair')):
+        t.append(' %s ' % tecla, style='bold black on %s' % FOSCO)
+        t.append(' %s   ' % desc, style=FOSCO)
+    return Align.center(t)
+
+
+# ------------------------------------------------------------------- loop ---
+
+
+def laco_host(unidades, parar):
+    """Coleta as unidades em paralelo: o ciclo dura o tempo da mais lenta."""
+    while not parar.is_set():
+        threads = [threading.Thread(target=u.coletar_host, daemon=True)
+                   for u in unidades]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=4.0)
+        parar.wait(INTERVALO_HOST)
+
+
+def _tenta(fn):
+    try:
+        fn()
+    except Exception:
+        pass
+
+
+def laco_containers(unidades, parar):
+    while not parar.is_set():
+        threads = [threading.Thread(target=_tenta, args=(u.coletar_containers,),
+                                    daemon=True) for u in unidades]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=8.0)
+        parar.wait(INTERVALO_CONTAINER)
+
+
+def ler_tecla():
+    if select.select([sys.stdin], [], [], 0)[0]:
+        c = sys.stdin.read(1)
+        if c == '\x1b':
+            seq = sys.stdin.read(2) if select.select([sys.stdin], [], [], 0.01)[0] else ''
+            return {'[C': 'direita', '[D': 'esquerda'}.get(seq, 'esc')
+        return c
+    return None
+
+
+def ajustar_janela(console):
+    """Pede ao terminal pra crescer ate o tamanho em que o painel cabe.
+
+    Manda a sequencia CSI 8 (a mesma que o `resize` do xterm usa). E uma
+    melhoria oportunista, nao uma garantia: varios emuladores ignoram esse
+    pedido por seguranca, e dentro de tmux ou screen ela teria que ser
+    reempacotada pra chegar no terminal de verdade — por isso esses casos
+    saem fora antes de escrever qualquer coisa, pra nao vazar lixo na tela.
+
+    So aumenta, nunca encolhe: diminuir a janela de alguem que ja deixou
+    ela grande seria pior do que nao fazer nada. Da pra desligar com
+    MAGI_SEM_RESIZE=1.
+    """
+    if os.environ.get('MAGI_SEM_RESIZE') or not sys.stdout.isatty():
+        return
+    if os.environ.get('TMUX') or os.environ.get('STY'):
+        return
+    larg, alt = console.size.width, console.size.height
+    if larg >= LARGURA_IDEAL and alt >= ALTURA_IDEAL:
+        return
+    sys.stdout.write('\x1b[8;%d;%dt' % (max(alt, ALTURA_IDEAL),
+                                        max(larg, LARGURA_IDEAL)))
+    sys.stdout.flush()
+    time.sleep(0.3)   # o terminal precisa de um instante pra aplicar
+
+
+def tela_boot(console, unidades):
+    """Sequencia de inicializacao com checagem real de alcance de cada
+    unidade e do Prometheus, antes de entrar no dashboard."""
+    console.clear()
+    # o logo com os arcos pede 26 linhas e a tela de boot inteira, 36. Se o
+    # terminal nao tiver essa altura (o pedido de resize pode ter sido
+    # recusado), a marca curta entra no lugar pra nada rolar pra fora.
+    console.print(Align.center(
+        emblema_grande() if console.size.height >= 38 else emblema()))
+    console.print()
+    console.print(Align.center(
+        Text('INICIALIZANDO SISTEMA MAGI', style='bold %s' % LARANJA)))
+    console.print(Align.center(Text('起動シーケンス', style=FOSCO)))
+    console.print()
+
+    for u in unidades:
+        ok = checar_porta(u.ip, 9100)
+        t = Text()
+        t.append('  > unidade %-22s ' % u.rotulo, style=FOSCO)
+        t.append('ONLINE' if ok else 'SEM RESPOSTA',
+                 style='bold %s' % (VERDE if ok else VERMELHO))
+        console.print(t)
+        time.sleep(0.15)
+
+    host_prom = urllib.parse.urlparse(PROM).hostname
+    porta_prom = urllib.parse.urlparse(PROM).port or 9090
+    prom_ok = checar_porta(host_prom, porta_prom) if host_prom else False
+    t = Text()
+    t.append('  > prometheus %-19s ' % ('(%s)' % host_prom), style=FOSCO)
+    t.append('ONLINE' if prom_ok else 'SEM RESPOSTA',
+             style='bold %s' % (VERDE if prom_ok else VERMELHO))
+    console.print(t)
+    time.sleep(0.15)
+    console.print()
+    console.print(Align.center(Text('carregando historico do Prometheus...', style=FOSCO)))
+
+
+def main():
+    console = Console()
+    unidades = [Unidade(c) for c in UNIDADES]
+
+    # antes do boot, nao depois: assim o logo e a checagem ja aparecem na
+    # geometria final e nao ha um salto de tamanho ao entrar no painel
+    ajustar_janela(console)
+    tela_boot(console, unidades)
+    threads = [threading.Thread(target=_tenta, args=(u.semear_historico,),
+                                daemon=True) for u in unidades]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=12.0)
+
+    console.print(Align.center(
+        Text('SISTEMA MAGI: PRONTO', style='bold %s' % VERDE)))
+    time.sleep(0.4)
+
+    parar = threading.Event()
+    threading.Thread(target=laco_host, args=(unidades, parar), daemon=True).start()
+    threading.Thread(target=laco_containers, args=(unidades, parar),
+                     daemon=True).start()
+
+    aba = 0
+    total_abas = 2 + len(unidades)  # GERAL + uma por unidade + DIAGRAMA
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        layout = Layout()
+        layout.split_column(
+            Layout(name='topo', size=3),
+            Layout(name='corpo'),
+            Layout(name='base', size=1),
+        )
+        with Live(layout, console=console, screen=True, refresh_per_second=4,
+                  transient=False):
+            while True:
+                tecla = ler_tecla()
+                if tecla:
+                    if tecla in ('q', 'Q', '\x03'):
+                        break
+                    if tecla.isdigit():
+                        idx = int(tecla) - 1
+                        if 0 <= idx < total_abas:
+                            aba = idx
+                    elif tecla == '\t' or tecla == 'direita':
+                        aba = (aba + 1) % total_abas
+                    elif tecla == 'esquerda':
+                        aba = (aba - 1) % total_abas
+                    elif tecla in ('r', 'R'):
+                        for u in unidades:
+                            try:
+                                u.coletar_containers()
+                            except Exception:
+                                pass
+
+                layout['topo'].update(cabecalho(aba, unidades))
+                if aba == 0:
+                    layout['corpo'].update(aba_geral(unidades))
+                elif aba == total_abas - 1:
+                    layout['corpo'].update(aba_diagrama(unidades))
+                else:
+                    layout['corpo'].update(
+                        aba_unidade(unidades[aba - 1]))
+                layout['base'].update(rodape())
+                time.sleep(0.1)
+    finally:
+        parar.set()
+        termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+    console.print('[%s]MAGI SYSTEM encerrado.[/]' % FOSCO)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,36 @@
+{
+  "prometheus": "http://10.0.0.10:9090",
+
+  "intervalo_host": 1,
+  "intervalo_container": 5,
+  "historico": 60,
+
+  "prefixo_tenant": "app_",
+
+  "largura_ideal": 106,
+  "altura_ideal": 40,
+
+  "unidades": [
+    {
+      "nome": "MELCHIOR",
+      "ord": "01",
+      "ip": "10.0.0.11",
+      "prom": "node-01",
+      "papel": "NODE-01 / WEB"
+    },
+    {
+      "nome": "BALTHASAR",
+      "ord": "02",
+      "ip": "10.0.0.12",
+      "prom": "node-02",
+      "papel": "NODE-02 / APP"
+    },
+    {
+      "nome": "CASPER",
+      "ord": "03",
+      "ip": "10.0.0.13",
+      "prom": "node-03",
+      "papel": "NODE-03 / DB"
+    }
+  ]
+}

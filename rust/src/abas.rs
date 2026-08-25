@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::cfg::{self, AMBAR, CIANO, FOSCO, LARANJA, TETO_MEM, VERDE, VERMELHO};
@@ -16,6 +16,119 @@ use crate::painel::painel_unidades;
 
 fn fosco<'a>(s: impl Into<String>) -> Span<'a> {
     Span::styled(s.into(), Style::new().fg(FOSCO))
+}
+
+
+// ------------------------------------------------------------- tabelas ---
+//
+// O `Table` do ratatui nao desenha separador entre colunas e estica pra
+// altura toda que recebe. A versao em Python usa a caixa padrao do rich, que
+// tem cabecalho pesado e regua entre as colunas — entao aqui a tabela e
+// montada a mao, pras duas versoes ficarem iguais.
+
+pub struct Cel<'a> {
+    pub spans: Vec<Span<'a>>,
+    /// Largura visual do conteudo, contada por quem monta: um span pode ter
+    /// mais bytes que colunas.
+    pub largura: usize,
+    pub direita: bool,
+}
+
+impl<'a> Cel<'a> {
+    pub fn txt(s: impl Into<String>, estilo: Style, direita: bool) -> Cel<'a> {
+        let s = s.into();
+        let largura = s.chars().count();
+        Cel {
+            spans: vec![Span::styled(s, estilo)],
+            largura,
+            direita,
+        }
+    }
+
+    pub fn spans(spans: Vec<Span<'a>>, largura: usize) -> Cel<'a> {
+        Cel {
+            spans,
+            largura,
+            direita: false,
+        }
+    }
+}
+
+fn preenche<'a>(cel: &Cel<'a>, largura: usize) -> Vec<Span<'a>> {
+    let folga = largura.saturating_sub(cel.largura);
+    let (antes, depois) = if cel.direita { (folga, 0) } else { (0, folga) };
+    let mut v = Vec::with_capacity(cel.spans.len() + 2);
+    if antes > 0 {
+        v.push(Span::raw(" ".repeat(antes)));
+    }
+    v.extend(cel.spans.iter().cloned());
+    if depois > 0 {
+        v.push(Span::raw(" ".repeat(depois)));
+    }
+    v
+}
+
+fn regua<'a>(larguras: &[usize], esq: &str, meio: &str, dir: &str, traco: &str) -> Line<'a> {
+    let mut s = String::from(esq);
+    for (i, l) in larguras.iter().enumerate() {
+        s.push_str(&traco.repeat(l + 2));
+        s.push_str(if i + 1 == larguras.len() { dir } else { meio });
+    }
+    Line::from(Span::styled(s, Style::new().fg(FOSCO)))
+}
+
+/// Monta a tabela inteira em linhas. `larguras` fixa cada coluna; a de indice
+/// `flexivel` recebe a sobra pra tabela ocupar a largura pedida.
+pub fn tabela<'a>(
+    cabecalho: &[&str],
+    larguras: &mut [usize],
+    flexivel: usize,
+    linhas: Vec<Vec<Cel<'a>>>,
+    largura_total: usize,
+) -> Vec<Line<'a>> {
+    let bordas = larguras.len() + 1;
+    let ocupado: usize = larguras.iter().map(|l| l + 2).sum::<usize>() + bordas;
+    if largura_total > ocupado {
+        larguras[flexivel] += largura_total - ocupado;
+    }
+    let barra = Span::styled("│", Style::new().fg(FOSCO));
+    let barra_forte = Span::styled("┃", Style::new().fg(FOSCO));
+
+    let mut saida = vec![regua(larguras, "┏", "┳", "┓", "━")];
+
+    // o cabecalho segue o alinhamento da coluna, como no rich: se os valores
+    // vao a direita, o titulo vai junto
+    let a_direita: Vec<bool> = (0..larguras.len())
+        .map(|i| linhas.first().map(|l| l[i].direita).unwrap_or(false))
+        .collect();
+
+    let mut spans = vec![barra_forte.clone()];
+    for (i, titulo) in cabecalho.iter().enumerate() {
+        let cel = Cel::txt(
+            *titulo,
+            Style::new().fg(LARANJA).add_modifier(Modifier::BOLD),
+            a_direita[i],
+        );
+        spans.push(Span::raw(" "));
+        spans.extend(preenche(&cel, larguras[i]));
+        spans.push(Span::raw(" "));
+        spans.push(barra_forte.clone());
+    }
+    saida.push(Line::from(spans));
+    saida.push(regua(larguras, "┡", "╇", "┩", "━"));
+
+    for linha in linhas {
+        let mut spans = vec![barra.clone()];
+        for (i, cel) in linha.iter().enumerate() {
+            spans.push(Span::raw(" "));
+            spans.extend(preenche(cel, larguras[i]));
+            spans.push(Span::raw(" "));
+            spans.push(barra.clone());
+        }
+        saida.push(Line::from(spans));
+    }
+    saida.push(regua(larguras, "└", "┴", "┘", "─"));
+    saida
 }
 
 // ------------------------------------------------------------ veredito ---
@@ -405,177 +518,139 @@ pub fn aba_unidade(f: &mut Frame, area: Rect, unidade: &Arc<Mutex<Unidade>>) {
         .map(|c| c.mem)
         .fold(0.0_f64, f64::max)
         .max(1.0);
-    let linhas: Vec<Row> = if u.containers.is_empty() {
-        vec![Row::new(vec![
-            Cell::from(if u.online {
-                "sem dados do Prometheus"
-            } else {
-                "unidade offline"
-            }),
-            Cell::from("-"),
-            Cell::from("-"),
-            Cell::from(""),
-            Cell::from("-"),
-            Cell::from("-"),
-        ])]
+    let corpo: Vec<Vec<Cel>> = if u.containers.is_empty() {
+        vec![vec![
+            Cel::txt(
+                if u.online {
+                    "sem dados do Prometheus"
+                } else {
+                    "unidade offline"
+                },
+                Style::new().fg(AMBAR),
+                false,
+            ),
+            Cel::txt("-", Style::new().fg(FOSCO), true),
+            Cel::txt("-", Style::new().fg(FOSCO), true),
+            Cel::txt("", Style::new(), false),
+            Cel::txt("-", Style::new().fg(FOSCO), true),
+            Cel::txt("-", Style::new().fg(FOSCO), true),
+        ]]
     } else {
         u.containers
             .iter()
             .map(|c| {
-                Row::new(vec![
-                    Cell::from(Span::styled(c.nome.clone(), Style::new().fg(AMBAR))),
-                    Cell::from(Line::from(Span::styled(
+                vec![
+                    Cel::txt(c.nome.clone(), Style::new().fg(AMBAR), false),
+                    Cel::txt(
                         format!("{:.1}", c.cpu),
                         Style::new().fg(cor_por_valor(c.cpu)),
-                    ))
-                    .alignment(ratatui::layout::Alignment::Right)),
-                    Cell::from(Line::from(Span::styled(
-                        bytes_h(c.mem),
-                        Style::new().fg(AMBAR),
-                    ))
-                    .alignment(ratatui::layout::Alignment::Right)),
-                    Cell::from(Line::from(barra(c.mem / pico * 100.0, 12))),
-                    Cell::from(Line::from(Span::styled(
+                        true,
+                    ),
+                    Cel::txt(bytes_h(c.mem), Style::new().fg(AMBAR), true),
+                    Cel::spans(barra(c.mem / pico * 100.0, 12), 12),
+                    Cel::txt(
                         if c.rx > 0.0 { bytes_h(c.rx) } else { "-".into() },
                         Style::new().fg(CIANO),
-                    ))
-                    .alignment(ratatui::layout::Alignment::Right)),
-                    Cell::from(Line::from(Span::styled(
+                        true,
+                    ),
+                    Cel::txt(
                         if c.tx > 0.0 { bytes_h(c.tx) } else { "-".into() },
                         Style::new().fg(CIANO),
-                    ))
-                    .alignment(ratatui::layout::Alignment::Right)),
-                ])
+                        true,
+                    ),
+                ]
             })
             .collect()
     };
 
-    let tabela = Table::new(
-        linhas,
-        [
-            Constraint::Min(16),
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Length(14),
-            Constraint::Length(10),
-            Constraint::Length(10),
-        ],
-    )
-    .header(
-        Row::new(vec!["CONTAINER", "CPU%", "MEM", "USO", "RX/s", "TX/s"]).style(
-            Style::new().fg(LARANJA).add_modifier(Modifier::BOLD),
-        ),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(FOSCO)),
+    let mut larguras = [16usize, 6, 9, 12, 9, 9];
+    let tab = tabela(
+        &["CONTAINER", "CPU%", "MEM", "USO", "RX/s", "TX/s"],
+        &mut larguras,
+        0,
+        corpo,
+        partes[1].width as usize,
     );
-    f.render_widget(tabela, partes[1]);
+    f.render_widget(Paragraph::new(tab), partes[1]);
 }
 
 // ------------------------------------------------------------ DIAGRAMA ---
 
 pub fn aba_diagrama(f: &mut Frame, area: Rect, unidades: &[Arc<Mutex<Unidade>>]) {
+    // borda arredondada e respiro interno, como o Panel do rich: sem eles o
+    // titulo encosta na moldura e a aba fica com outra cara
     let b = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(FOSCO));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(FOSCO))
+        .padding(Padding::new(2, 2, 1, 1));
     let dentro = b.inner(area);
     f.render_widget(b, area);
 
-    let partes = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(16),
-            Constraint::Length(2),
-            Constraint::Min(0),
-        ])
-        .split(dentro);
-
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
+    let mut linhas: Vec<Line> = vec![
+        Line::from(Span::styled(
             "DIAGRAMA DE DISPONIBILIDADE",
             Style::new().fg(LARANJA).add_modifier(Modifier::BOLD),
-        ))),
-        partes[0],
-    );
-    f.render_widget(
-        Paragraph::new(painel_unidades(unidades))
-            .alignment(ratatui::layout::Alignment::Center),
-        partes[1],
-    );
-    f.render_widget(
-        Paragraph::new(Line::from(fosco("latencia ate cada unidade (tailnet)"))),
-        partes[2],
-    );
+        )),
+        Line::from(""),
+    ];
 
-    let linhas: Vec<Row> = unidades
+    let largura = dentro.width as usize;
+    for l in painel_unidades(unidades) {
+        let comp: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
+        let pad = largura.saturating_sub(comp) / 2;
+        let mut spans = vec![Span::raw(" ".repeat(pad))];
+        spans.extend(l.spans);
+        linhas.push(Line::from(spans));
+    }
+
+    linhas.push(Line::from(""));
+    linhas.push(Line::from(fosco("latencia ate cada unidade (tailnet)")));
+
+    let corpo: Vec<Vec<Cel>> = unidades
         .iter()
         .map(|u| {
             let u = u.lock().unwrap();
             let hist: Vec<f64> = u.hist_latencia.iter().cloned().collect();
+            let nome = Cel::txt(
+                u.rotulo(),
+                Style::new().fg(AMBAR).add_modifier(Modifier::BOLD),
+                false,
+            );
             match u.latencia_ms {
-                None => Row::new(vec![
-                    Cell::from(Span::styled(
-                        u.rotulo(),
-                        Style::new().fg(AMBAR).add_modifier(Modifier::BOLD),
-                    )),
-                    Cell::from(Span::styled("sem resposta", Style::new().fg(VERMELHO))),
-                    Cell::from(Line::from(faisca(&hist, 22, VERMELHO, None))),
-                    Cell::from("-"),
-                    Cell::from("-"),
-                ]),
+                None => vec![
+                    nome,
+                    Cel::txt("sem resposta", Style::new().fg(VERMELHO), true),
+                    Cel::spans(faisca(&hist, 22, VERMELHO, None), 22),
+                    Cel::txt("-", Style::new().fg(FOSCO), true),
+                    Cel::txt("-", Style::new().fg(FOSCO), true),
+                ],
                 Some(l) => {
                     let cor = cor_latencia(l);
                     let mn = hist.iter().cloned().fold(f64::INFINITY, f64::min).min(l);
                     let mx = hist.iter().cloned().fold(0.0_f64, f64::max).max(l);
-                    Row::new(vec![
-                        Cell::from(Span::styled(
-                            u.rotulo(),
-                            Style::new().fg(AMBAR).add_modifier(Modifier::BOLD),
-                        )),
-                        Cell::from(
-                            Line::from(Span::styled(format!("{:.0}ms", l), Style::new().fg(cor)))
-                                .alignment(ratatui::layout::Alignment::Right),
-                        ),
-                        Cell::from(Line::from(faisca(&hist, 22, cor, None))),
-                        Cell::from(
-                            Line::from(format!("{:.0}ms", mn))
-                                .alignment(ratatui::layout::Alignment::Right),
-                        ),
-                        Cell::from(
-                            Line::from(format!("{:.0}ms", mx))
-                                .alignment(ratatui::layout::Alignment::Right),
-                        ),
-                    ])
+                    vec![
+                        nome,
+                        Cel::txt(format!("{:.0}ms", l), Style::new().fg(cor), true),
+                        Cel::spans(faisca(&hist, 22, cor, None), 22),
+                        Cel::txt(format!("{:.0}ms", mn), Style::new(), true),
+                        Cel::txt(format!("{:.0}ms", mx), Style::new(), true),
+                    ]
                 }
             }
         })
         .collect();
 
-    // quem estica e o HISTORICO: com a primeira coluna flexivel, ela absorvia
-    // toda a folga e jogava PING pro meio da tabela
-    let tabela = Table::new(
-        linhas,
-        [
-            Constraint::Length(16),
-            Constraint::Length(10),
-            Constraint::Min(24),
-            Constraint::Length(9),
-            Constraint::Length(9),
-        ],
-    )
-    .header(
-        Row::new(vec!["UNIDADE", "PING", "HISTORICO", "MIN", "MAX"])
-            .style(Style::new().fg(LARANJA).add_modifier(Modifier::BOLD)),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(FOSCO)),
-    );
-    f.render_widget(tabela, partes[3]);
+    let mut larguras = [16usize, 8, 22, 7, 7];
+    linhas.extend(tabela(
+        &["UNIDADE", "PING", "HISTORICO", "MIN", "MAX"],
+        &mut larguras,
+        2,
+        corpo,
+        largura,
+    ));
+
+    f.render_widget(Paragraph::new(linhas), dentro);
 }
 
 fn cor_latencia(ms: f64) -> ratatui::style::Color {

@@ -308,8 +308,14 @@ class Unidade:
         i = self.prom
         cpu = prom_query('sum by (name) (rate(container_cpu_usage_seconds_total'
                          '{instance="%s",name!=""}[2m])) * 100' % i)
-        mem = prom_query('sum by (name) (container_memory_usage_bytes'
-                         '{instance="%s",name!=""})' % i)
+        # uso real, sem o cache reclaimavel do kernel (dentry/inode slab, que
+        # o kernel devolve sob pressao e inflava os apps). rss + page cache e
+        # o que a aplicacao de fato ocupa; buscados separados pra um container
+        # nao sumir se uma metrica faltar
+        mem_rss = prom_query('sum by (name) (container_memory_rss'
+                             '{instance="%s",name!=""})' % i)
+        mem_cache = prom_query('sum by (name) (container_memory_cache'
+                               '{instance="%s",name!=""})' % i)
         rx = prom_query('sum by (name) (rate(container_network_receive_bytes_total'
                         '{instance="%s",name!=""}[2m]))' % i)
         tx = prom_query('sum by (name) (rate(container_network_transmit_bytes_total'
@@ -319,7 +325,10 @@ class Unidade:
             return {s['metric'].get('name', '?'): float(s['value'][1])
                     for s in res}
 
-        mc, mm, mr, mt = mapa(cpu), mapa(mem), mapa(rx), mapa(tx)
+        mc, mr, mt = mapa(cpu), mapa(rx), mapa(tx)
+        m_rss, m_cache = mapa(mem_rss), mapa(mem_cache)
+        mm = {n: m_rss.get(n, 0.0) + m_cache.get(n, 0.0)
+              for n in set(m_rss) | set(m_cache)}
         nomes = set(mc) | set(mm)
         lista = [{'nome': n, 'cpu': mc.get(n, 0.0), 'mem': mm.get(n, 0.0),
                   'rx': mr.get(n, 0.0), 'tx': mt.get(n, 0.0)} for n in nomes]

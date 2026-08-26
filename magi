@@ -470,6 +470,53 @@ ARCOS_GRANDE = (   # fundo do LOGO_GRANDE, mesma grade
     '                 ⠉⠓⠛⠯⠷⠶⣖⣒⣒⣒⣒⣲⠶⠾⠽⠛⠚⠉⠁',
 )
 
+LOGO_MEDIO = (
+    r"""                                        """,
+    r"""                                        """,
+    r"""                                        """,
+    r"""          ⠰⡖⠒⢒⣶⡶⠖⢲⡄                     """,
+    r"""           ⠹⣶⠟⠋⢀⣴⡾⠿⣄                    """,
+    r"""            ⠘⣦⣾⠟⠋⢀⣴⡿⣆                   """,
+    r"""             ⠘⢧⣠⣾⠟⠋ ⠘⣧                  """,
+    r"""              ⠈⢯⡁  ⢀⣤⢾⣧⡀                """,
+    r"""               ⢈⡇⣠⡶⠋ ⠈⡏⠷⠦⠤⣤⠤⠤⣤⠤⢤⡤⠤⢤⠄    """,
+    r"""              ⢠⣾⡞⠁    ⣧   ⢻⡆ ⣿ ⠘⣿⣰⠏     """,
+    r"""             ⣠⠟ ⠉⠓⠶⢤⣀⡀⢸   ⢸⡇ ⢻⡆ ⡿⠃      """,
+    r"""            ⣠⣯⣄⡀   ⣠⠬⠭⠿⠤⠤⠤⠼⠷⠤⠼⠧⠼⠁       """,
+    r"""           ⣰⣋⠈⠙⠛⠷⣶⡴⠃                    """,
+    r"""          ⢸⡏⠛⠻⢶⣦⣤⡼⠃                     """,
+    r"""           ⠹⣶⣤⣄⣀⡿⠁                      """,
+    r"""            ⠹⣎⢩⡟                        """,
+    r"""             ⠙⠟                         """,
+    r"""                                        """,
+    r"""                                        """,
+    r"""                                        """,
+)
+
+ARCOS_MEDIO = (
+    r"""            ⣀⣠⣤⣶⠶⠾⠽⠛⠛⠯⠷⠶⢶⣤⣄⣀            """,
+    r"""        ⢀⣤⡶⠿⠛⣉⣠⣤⠴⠶⠶⠖⠲⠶⠶⠦⣤⣄⣉⠙⠻⢶⣤⡀        """,
+    r"""      ⣠⣶⠟⢉⣤⡶⢛⣩⣵⠶⠖⢛⣛⣛⣛⣛⣛⠳⠶⣮⣍⡛⠶⣤⡉⠻⢷⣄      """,
+    r"""    ⢠⣾⠟⢡⡶⢛⣥⠞⢋⣡⠴⠚⠛⣉⣭⣭⣭⣭⣍⣛⠓⠶⣬⣙⠷⣮⡛⢶⣄⠙⢷⣄    """,
+    r"""   ⣴⡟⢁⣼⢋⣴⢟⣵⠞⢉⡠⠖⢋⣉⣡⠤⠶⠶⠶⣬⣭⣙⠳⢦⣝⠳⣮⡻⣦⡙⢧⠈⠻⣦   """,
+    r"""  ⣼⡏⢠⡿⣡⡟⣱⠟⢁⡴⣋⡤⠞⣉⡤⠴⠒⠒⠒⠒⠶⢤⣍⡻⢶⣝⢷⣌⠻⣎⢻⣎⢳⡀⠹⣷⡀ """,
+    r"""⢀⣼⡟⢠⡟⣰⠏⣼⢋⡴⢋⡾⢋⡴⠚⣡⠴⠒⣉⣉⣉⣙⠛⠶⣬⡻⢦⡙⢷⡝⢷⡙⣧⠹⣆⢻⡀⠹⣧ """,
+    r"""⣼⣿ ⣾⢱⡏⣸⠃⡾⢡⡟⣱⠟⣵⠟⣡⠖⠋⠁  ⠈⠙⠳⣮⠻⣦⠻⣎⢻⡌⢷⡘⣧⢹⡄⢳ ⢻⡆""",
+    r"""⣿⡇⢰⡇⣸⢀⡟⣸⠇⣿⢰⡟⣼⢃⡾⠃        ⠘⢳⡘⢇⠹⡌⢻⠘⡇⢻⡈⣧⢸⡀⠸⣷""",
+    r"""⣷⠃⢸⢃⡏⣸⣇⣿⣸⣇⣾⣀⣏⣸⠃           ⡇⢸ ⡇⢸ ⢧⢠⡇⣿⠘⡇ ⣿""",
+    r"""⡿⡄⢸⡄⡇⢸⡏⣿⠹⡏⢻⠉⣏⢹⡀           ⡇⢸ ⡇⢸ ⡼⢸⡇⣿⢀⡇ ⣿""",
+    r"""⣿⡇ ⡇⢹ ⣇⠸⡄⢷⠸⣇⠹⡄⢧⡀         ⡼⢁⡞⢰⠃⡼⢠⡇⢸⢁⡿⢸⡇⢰⡿""",
+    r"""⢻⣷ ⢳⠘⡆⠸⡄⢳⡈⢧⠘⣆⠙⣄⠑⢦⣀    ⣀⡤⠚⣠⠞⣠⠏⡸⢁⡾⢁⡏⣸⠃⣾ ⣼⠇""",
+    r"""⠈⢻⣇⠈⢧⠘⣄⠳⡄⠳⡌⠳⣌⠳⣌⠑⠦⢌⣉⣉⣉⣉⣡⠴⠚⣡⠞⢁⡞⢁⡾⢁⡞⢰⠏⡸⠃⢰⡟ """,
+    r"""  ⢻⣆⠈⢧⡘⢆⠙⢦⠙⢦⣈⠳⢤⣉⠓⠦⠤⠤⠤⠤⠴⠒⣋⡡⠞⢉⡴⠋⣠⠏⣠⠏⡼⠁⣰⡿⠁ """,
+    r"""   ⠻⣧⡀⠱⣌⠳⣄⠙⢦⡈⠓⠦⣈⣉⠒⠒⠒⠒⠒⠒⢋⣁⡤⠞⢉⡤⠞⣡⠞⣡⠞ ⣴⡟⠁  """,
+    r"""    ⠙⢷⣄⠈⠳⢌⡓⢦⣈⠓⠦⢤⣈⣉⠉⠓⠒⠋⣉⣉⡤⠴⠚⣉⡤⠞⣡⠞⠁⣠⡾⠋    """,
+    r"""      ⠙⢷⣦⡀⠙⠲⢬⣙⠒⠦⠤⣌⣉⣉⣉⣉⣁⡤⠴⠒⢋⡡⠖⠋⢀⣤⡾⠋      """,
+    r"""        ⠈⠛⢷⣦⣄⡈⠉⠒⠒⠢⠤⠤⠤⠤⠴⠒⠒⠋⢁⣀⣴⡾⠟⠉        """,
+    r"""           ⠈⠉⠛⠻⠶⢶⣦⣤⣤⣤⣤⣴⡶⠶⠟⠛⠉⠁           """,
+)
+
+
 LOGO_PEQUENO = (   # 24 colunas x 13 linhas
     ' ⣤⠤⠤⢤⣤⠤⢤',
     ' ⠈⢧⡾⠋⠁⣠⡾⢳⡀',
@@ -510,6 +557,12 @@ def _logo(marca, arcos=()):
 def emblema_grande():
     """O simbolo com os arcos concentricos, pra tela de boot."""
     return _logo(LOGO_GRANDE, ARCOS_GRANDE)
+
+
+def emblema_medio():
+    """Versao com arcos, menor, pra janela que nao comporta o grande mas
+    ainda tem folga. Mantem o circulo, que e o que some no logo curto."""
+    return _logo(LOGO_MEDIO, ARCOS_MEDIO)
 
 
 def emblema():
@@ -1182,11 +1235,18 @@ def tela_boot(console, unidades):
     """Sequencia de inicializacao com checagem real de alcance de cada
     unidade e do Prometheus, antes de entrar no dashboard."""
     console.clear()
-    # o logo com os arcos pede 26 linhas e a tela de boot inteira, 36. Se o
-    # terminal nao tiver essa altura (o pedido de resize pode ter sido
-    # recusado), a marca curta entra no lugar pra nada rolar pra fora.
-    console.print(Align.center(
-        emblema_grande() if console.size.height >= 38 else emblema()))
+    # escolhe o maior logo que cabe na janela real. O resize (CSI 8) e
+    # ignorado por varios terminais (kitty, alacritty, foot), entao nao da pra
+    # contar com ele: o grande pede ~38 linhas de tela, o medio ~29, e ambos
+    # tem os arcos concentricos. So abaixo disso cai na marca curta sem arcos.
+    h = console.size.height
+    if h >= 38:
+        arte = emblema_grande()
+    elif h >= 29:
+        arte = emblema_medio()
+    else:
+        arte = emblema()
+    console.print(Align.center(arte))
     console.print()
     console.print(Align.center(
         Text('INICIALIZANDO SISTEMA MAGI', style='bold %s' % LARANJA)))

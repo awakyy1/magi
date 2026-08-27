@@ -7,10 +7,12 @@
 //!
 //! Os nos vem de um arquivo de configuracao; veja magi.example.json.
 //!
-//! Teclas: 1..5 ou setas trocam de aba, TAB cicla, q sai, r forca atualizacao.
+//! Teclas: 1..5 ou setas trocam de aba (1..6 com a aba CLUSTER configurada),
+//! TAB cicla, q sai, r forca atualizacao.
 
 mod abas;
 mod cfg;
+mod cluster;
 mod coleta;
 mod fmt;
 mod logo;
@@ -32,6 +34,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use cfg::{FOSCO, LARANJA, VERDE, VERMELHO};
+use cluster::Cluster;
 use coleta::Unidade;
 
 type Unidades = Vec<Arc<Mutex<Unidade>>>;
@@ -255,10 +258,16 @@ fn main() -> io::Result<()> {
     }
 
     let parar = Arc::new(AtomicBool::new(false));
+    let estado_cluster = Arc::new(Mutex::new(Cluster::default()));
     laco_host(&unidades, Arc::clone(&parar));
     laco_containers(&unidades, Arc::clone(&parar));
+    laco_cluster(
+        &unidades,
+        Arc::clone(&estado_cluster),
+        Arc::clone(&parar),
+    );
 
-    let r = rodar_ui(&unidades);
+    let r = rodar_ui(&unidades, &estado_cluster);
     parar.store(true, Ordering::Relaxed);
     r
 }
@@ -300,7 +309,25 @@ fn laco_containers(unidades: &Unidades, parar: Arc<AtomicBool>) {
     }
 }
 
-fn rodar_ui(unidades: &Unidades) -> io::Result<()> {
+/// A vista por tenant depende do consumo que o laco de containers traz, entao
+/// espera um ciclo antes da primeira coleta: comecar junto mostraria a tabela
+/// com as colunas de CPU e memoria vazias.
+fn laco_cluster(unidades: &Unidades, estado: Arc<Mutex<Cluster>>, parar: Arc<AtomicBool>) {
+    if !cfg::get().tem_cluster() {
+        return;
+    }
+    let unidades: Unidades = unidades.to_vec();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(2));
+        while !parar.load(Ordering::Relaxed) {
+            let r = cluster::buscar(&unidades);
+            estado.lock().unwrap().aplicar(r);
+            thread::sleep(Duration::from_secs(cfg::get().intervalo_container));
+        }
+    });
+}
+
+fn rodar_ui(unidades: &Unidades, estado_cluster: &Arc<Mutex<Cluster>>) -> io::Result<()> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
@@ -311,7 +338,9 @@ fn rodar_ui(unidades: &Unidades) -> io::Result<()> {
         },
     )?;
 
-    let total_abas = unidades.len() + 2;
+    // GERAL + uma por unidade + DIAGRAMA, e CLUSTER so quando configurada
+    let com_cluster = cfg::get().tem_cluster();
+    let total_abas = unidades.len() + 2 + usize::from(com_cluster);
     let mut aba = 0usize;
     let mut ultimo = Instant::now();
 
@@ -341,6 +370,14 @@ fn rodar_ui(unidades: &Unidades) -> io::Result<()> {
                                     u.lock().unwrap().aplicar_containers(lista);
                                 });
                             }
+                            if com_cluster {
+                                let us: Unidades = unidades.to_vec();
+                                let est = Arc::clone(estado_cluster);
+                                thread::spawn(move || {
+                                    let r = cluster::buscar(&us);
+                                    est.lock().unwrap().aplicar(r);
+                                });
+                            }
                         }
                         _ => {}
                     }
@@ -363,7 +400,9 @@ fn rodar_ui(unidades: &Unidades) -> io::Result<()> {
                 abas::cabecalho(f, partes[0], aba, unidades, &hora);
                 if aba == 0 {
                     abas::aba_geral(f, partes[1], unidades);
-                } else if aba == total_abas - 1 {
+                } else if com_cluster && aba == total_abas - 1 {
+                    abas::aba_cluster(f, partes[1], unidades, estado_cluster);
+                } else if aba == unidades.len() + 1 {
                     abas::aba_diagrama(f, partes[1], unidades);
                 } else {
                     abas::aba_unidade(f, partes[1], &unidades[aba - 1]);

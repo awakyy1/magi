@@ -8,7 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::cfg::{self, AMBAR, CIANO, FOSCO, LARANJA, TETO_MEM, VERDE, VERMELHO};
+use crate::cfg::{self, AMBAR, CIANO, FOSCO, LARANJA, LARANJA_FORTE, TETO_MEM, VERDE, VERMELHO};
+use crate::cluster::{Cluster, Linha};
 use crate::coleta::Unidade;
 use crate::fmt::{barra, bytes_h, cor_por_valor, dur_h, faisca, linha_metrica};
 use crate::logo;
@@ -521,12 +522,14 @@ pub fn aba_unidade(f: &mut Frame, area: Rect, unidade: &Arc<Mutex<Unidade>>) {
     let corpo: Vec<Vec<Cel>> = if u.containers.is_empty() {
         vec![vec![
             Cel::txt(
-                if u.online {
+                if cfg::get().sem_cadvisor(&u.prom) {
+                    "sem cAdvisor nesta unidade, nao ha metrica de container"
+                } else if u.online {
                     "sem dados do Prometheus"
                 } else {
                     "unidade offline"
                 },
-                Style::new().fg(AMBAR),
+                Style::new().fg(FOSCO),
                 false,
             ),
             Cel::txt("-", Style::new().fg(FOSCO), true),
@@ -540,7 +543,11 @@ pub fn aba_unidade(f: &mut Frame, area: Rect, unidade: &Arc<Mutex<Unidade>>) {
             .iter()
             .map(|c| {
                 vec![
-                    Cel::txt(c.nome.clone(), Style::new().fg(AMBAR), false),
+                    Cel::txt(
+                        c.curto.clone(),
+                        Style::new().fg(if c.swarm { AMBAR } else { FOSCO }),
+                        false,
+                    ),
                     Cel::txt(
                         format!("{:.1}", c.cpu),
                         Style::new().fg(cor_por_valor(c.cpu)),
@@ -564,14 +571,333 @@ pub fn aba_unidade(f: &mut Frame, area: Rect, unidade: &Arc<Mutex<Unidade>>) {
     };
 
     let mut larguras = [16usize, 6, 9, 12, 9, 9];
-    let tab = tabela(
-        &["CONTAINER", "CPU%", "MEM", "USO", "RX/s", "TX/s"],
+    let mut tab = tabela(
+        &["TASK / CONTAINER", "CPU%", "MEM", "USO", "RX/s", "TX/s"],
         &mut larguras,
         0,
         corpo,
         partes[1].width as usize,
     );
+    let n_swarm = u.containers.iter().filter(|c| c.swarm).count();
+    if n_swarm > 0 {
+        tab.push(Line::from(vec![
+            fosco("  tasks de swarm "),
+            Span::styled(format!("{}", n_swarm), Style::new().fg(AMBAR)),
+            fosco("   containers soltos "),
+            Span::styled(
+                format!("{}", u.containers.len() - n_swarm),
+                Style::new().fg(AMBAR),
+            ),
+            fosco("   * = servico global"),
+        ]));
+    }
     f.render_widget(Paragraph::new(tab), partes[1]);
+}
+
+// -------------------------------------------------------------- CLUSTER ---
+
+/// Cor unica do tenant, tirada do pior sinal entre site, banco e replica.
+fn estado_tenant(x: &Linha) -> ratatui::style::Color {
+    if x.site == Some(0.0) || !x.db_up {
+        return VERMELHO;
+    }
+    if !x.rep_existe || !x.rep_ok {
+        return LARANJA_FORTE;
+    }
+    if x.rep_lag.map(|l| l >= 60.0).unwrap_or(false) {
+        return LARANJA_FORTE;
+    }
+    if x.site.is_none() || !x.tem_task {
+        return FOSCO;
+    }
+    VERDE
+}
+
+fn cel_pct<'a>(v: Option<f64>) -> Cel<'a> {
+    match v {
+        None => Cel::txt("-", Style::new().fg(FOSCO), true),
+        Some(v) => Cel::txt(format!("{:.1}", v), Style::new().fg(cor_por_valor(v)), true),
+    }
+}
+
+fn cel_bytes<'a>(v: Option<f64>) -> Cel<'a> {
+    match v {
+        None => Cel::txt("-", Style::new().fg(FOSCO), true),
+        Some(v) => Cel::txt(bytes_h(v), Style::new().fg(AMBAR), true),
+    }
+}
+
+fn tabela_tenants<'a>(
+    linhas: &[Linha],
+    titulo: &str,
+    larg_total: usize,
+    larg_barra: usize,
+    pico: f64,
+    mostrar_no: bool,
+) -> Vec<Line<'a>> {
+    let mut corpo: Vec<Vec<Cel>> = Vec::with_capacity(linhas.len());
+    for x in linhas {
+        let cor = estado_tenant(x);
+        let mut cels = vec![Cel::txt(
+            format!(
+                "{} {}",
+                if cor == VERDE { "●" } else { "○" },
+                x.tenant.chars().take(11).collect::<String>()
+            ),
+            Style::new().fg(cor),
+            false,
+        )];
+        if mostrar_no {
+            cels.push(Cel::txt(x.no.clone(), Style::new().fg(CIANO), false));
+        }
+        cels.push(match x.site {
+            None => Cel::txt("?", Style::new().fg(FOSCO), false),
+            Some(v) if v == 1.0 => Cel::txt("UP", Style::new().fg(VERDE), false),
+            Some(_) => Cel::txt("OFF", Style::new().fg(VERMELHO), false),
+        });
+        cels.push(match x.latencia {
+            None => Cel::txt("-", Style::new().fg(FOSCO), true),
+            Some(v) => Cel::txt(
+                format!("{}", (v * 1000.0) as i64),
+                Style::new().fg(AMBAR),
+                true,
+            ),
+        });
+        cels.push(cel_pct(x.app_cpu));
+        cels.push(cel_bytes(x.app_mem));
+        cels.push(cel_pct(x.db_cpu));
+        cels.push(cel_bytes(x.db_mem));
+        cels.push(if !x.rep_existe {
+            Cel::txt("ausente", Style::new().fg(VERMELHO), false)
+        } else if !x.rep_ok {
+            Cel::txt(
+                format!("{} PARADA", x.no_rep),
+                Style::new().fg(VERMELHO),
+                false,
+            )
+        } else {
+            match x.rep_lag {
+                None => Cel::txt(format!("{} ok", x.no_rep), Style::new().fg(VERDE), false),
+                Some(l) => {
+                    let cor = if l < 30.0 {
+                        VERDE
+                    } else if l < 300.0 {
+                        LARANJA_FORTE
+                    } else {
+                        VERMELHO
+                    };
+                    Cel::txt(
+                        format!("{} {}s", x.no_rep, l as i64),
+                        Style::new().fg(cor),
+                        false,
+                    )
+                }
+            }
+        });
+        cels.push(Cel::spans(
+            barra(x.cpu_total() / pico * 100.0, larg_barra),
+            larg_barra,
+        ));
+        corpo.push(cels);
+    }
+
+    if corpo.is_empty() {
+        let n = if mostrar_no { 10 } else { 9 };
+        let mut vazia = vec![Cel::txt("sem dados", Style::new().fg(FOSCO), false)];
+        for _ in 1..n {
+            vazia.push(Cel::txt("", Style::new(), false));
+        }
+        corpo.push(vazia);
+    }
+
+    let (cab, mut larguras): (Vec<&str>, Vec<usize>) = if mostrar_no {
+        (
+            vec![
+                "TENANT", "NO", "SITE", "ms", "APP", "MEM", "DB", "MEM", "REPL", "CPU",
+            ],
+            vec![13, 3, 4, 4, 5, 7, 5, 7, 8, larg_barra],
+        )
+    } else {
+        (
+            vec!["TENANT", "SITE", "ms", "APP", "MEM", "DB", "MEM", "REPL", "CPU"],
+            vec![13, 4, 4, 5, 7, 5, 7, 8, larg_barra],
+        )
+    };
+    let flexivel = larguras.len() - 1;
+
+    let mut saida = vec![Line::from(Span::styled(
+        titulo.to_string(),
+        Style::new().fg(AMBAR).add_modifier(Modifier::BOLD),
+    ))];
+    saida.extend(tabela(&cab, &mut larguras, flexivel, corpo, larg_total));
+    saida
+}
+
+fn resumo_cluster<'a>(
+    cluster: &Cluster,
+    unidades: &[Arc<Mutex<Unidade>>],
+) -> Vec<Line<'a>> {
+    let r = cluster.resumo();
+    let mut tasks = 0usize;
+    let mut soltos = 0usize;
+    let mut servicos: Vec<(String, String)> = Vec::new();
+    for u in unidades {
+        for c in &u.lock().unwrap().containers {
+            if c.swarm {
+                tasks += 1;
+                let par = (c.stack.clone(), c.svc.clone());
+                if !servicos.contains(&par) {
+                    servicos.push(par);
+                }
+            } else {
+                soltos += 1;
+            }
+        }
+    }
+
+    let inteiro = r.total > 0 && r.no_ar == r.total;
+    let todas = r.total > 0 && r.replicando == r.total;
+    let l1 = Line::from(vec![
+        fosco("tenants    "),
+        Span::styled(format!("{}", r.total), Style::new().fg(AMBAR)),
+        fosco("   no ar "),
+        Span::styled(
+            format!("{}/{}", r.no_ar, r.total),
+            Style::new()
+                .fg(if inteiro { VERDE } else { VERMELHO })
+                .add_modifier(Modifier::BOLD),
+        ),
+        fosco("      servicos "),
+        Span::styled(format!("{}", servicos.len()), Style::new().fg(AMBAR)),
+        fosco("   tasks "),
+        Span::styled(format!("{}", tasks), Style::new().fg(AMBAR)),
+        fosco("   soltos "),
+        Span::styled(format!("{}", soltos), Style::new().fg(AMBAR)),
+    ]);
+
+    let lag = match r.lag_max {
+        None => fosco("-"),
+        Some(l) => Span::styled(
+            format!("{}s", l as i64),
+            Style::new().fg(if l < 30.0 { VERDE } else { LARANJA_FORTE }),
+        ),
+    };
+    let veredito: Vec<Span> = if !cluster.erro.is_empty() {
+        vec![Span::styled(
+            cluster.erro.to_uppercase(),
+            Style::new().fg(VERMELHO).add_modifier(Modifier::BOLD),
+        )]
+    } else if !r.fora.is_empty() {
+        vec![Span::styled(
+            format!("FORA DO AR: {}", r.fora.join(", ")),
+            Style::new().fg(VERMELHO).add_modifier(Modifier::BOLD),
+        )]
+    } else if !r.sem_replica.is_empty() {
+        vec![Span::styled(
+            format!("SEM REPLICA: {}", r.sem_replica.join(", ")),
+            Style::new().fg(LARANJA_FORTE).add_modifier(Modifier::BOLD),
+        )]
+    } else if r.total > 0 {
+        vec![Span::styled(
+            "CLUSTER INTEGRO",
+            Style::new().fg(VERDE).add_modifier(Modifier::BOLD),
+        )]
+    } else {
+        vec![fosco("COLETANDO")]
+    };
+
+    let mut l2 = vec![
+        fosco("replicando "),
+        Span::styled(
+            format!("{}/{}", r.replicando, r.total),
+            Style::new()
+                .fg(if todas { VERDE } else { LARANJA_FORTE })
+                .add_modifier(Modifier::BOLD),
+        ),
+        fosco("   lag max "),
+        lag,
+        fosco("      veredito "),
+    ];
+    l2.extend(veredito);
+
+    vec![l1, Line::from(l2)]
+}
+
+pub fn aba_cluster(
+    f: &mut Frame,
+    area: Rect,
+    unidades: &[Arc<Mutex<Unidade>>],
+    cluster: &Arc<Mutex<Cluster>>,
+) {
+    let guarda = cluster.lock().unwrap();
+    let linhas: Vec<Linha> = guarda.tenants.clone();
+    let pico = guarda.escala_cpu();
+    let topo = resumo_cluster(&guarda, unidades);
+    drop(guarda);
+
+    let partes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(0)])
+        .split(area);
+
+    let b = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(FOSCO))
+        .title(Span::styled("SWARM", Style::new().fg(LARANJA)));
+    let dentro = b.inner(partes[0]);
+    f.render_widget(b, partes[0]);
+    f.render_widget(Paragraph::new(topo), dentro);
+
+    // em terminal largo divide por no, que e a vista que mostra
+    // desbalanceamento; em terminal estreito uma tabela so, senao as colunas
+    // somem
+    let com_caixa: Vec<String> = cfg::get()
+        .nos
+        .iter()
+        .filter(|n| !n.caixa.is_empty())
+        .map(|n| {
+            if n.sigla.is_empty() {
+                n.nome.chars().take(3).collect()
+            } else {
+                n.sigla.clone()
+            }
+        })
+        .collect();
+
+    // exatamente dois: com tres ou mais nos hospedando tenant, duas colunas
+    // esconderiam um deles em silencio, e a tabela unica mostra a coluna NO
+    if partes[1].width >= 156 && !linhas.is_empty() && com_caixa.len() == 2 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .split(partes[1]);
+        let larg_b = (((partes[1].width as usize).saturating_sub(160)) / 2 + 8).clamp(8, 24);
+        for (i, sig) in com_caixa.iter().enumerate() {
+            let desta: Vec<Linha> = linhas.iter().filter(|x| &x.no == sig).cloned().collect();
+            let tab = tabela_tenants(
+                &desta,
+                &format!("{} · {} TENANTS", sig, desta.len()),
+                cols[i].width as usize,
+                larg_b,
+                pico,
+                false,
+            );
+            f.render_widget(Paragraph::new(tab), cols[i]);
+        }
+    } else {
+        let mut ordenadas = linhas.clone();
+        ordenadas.sort_by(|a, b| a.no.cmp(&b.no).then(a.tenant.cmp(&b.tenant)));
+        let larg_b = ((partes[1].width as usize).saturating_sub(82)).clamp(8, 48);
+        let tab = tabela_tenants(
+            &ordenadas,
+            "TENANTS",
+            partes[1].width as usize,
+            larg_b,
+            pico,
+            true,
+        );
+        f.render_widget(Paragraph::new(tab), partes[1]);
+    }
 }
 
 // ------------------------------------------------------------ DIAGRAMA ---
@@ -698,6 +1024,9 @@ pub fn cabecalho(f: &mut Frame, area: Rect, aba: usize, unidades: &[Arc<Mutex<Un
     let mut nomes: Vec<String> = vec!["GERAL".into()];
     nomes.extend(unidades.iter().map(|u| u.lock().unwrap().nome.clone()));
     nomes.push("DIAGRAMA".into());
+    if cfg::get().tem_cluster() {
+        nomes.push("CLUSTER".into());
+    }
     let mut spans = Vec::new();
     for (i, nome) in nomes.iter().enumerate() {
         let txt = format!(" {} {} ", i + 1, nome);
@@ -729,7 +1058,7 @@ pub fn cabecalho(f: &mut Frame, area: Rect, aba: usize, unidades: &[Arc<Mutex<Un
 pub fn rodape(f: &mut Frame, area: Rect) {
     let mut spans = Vec::new();
     for (tecla, desc) in [
-        ("1-5", "abas"),
+        (if cfg::get().tem_cluster() { "1-6" } else { "1-5" }, "abas"),
         ("TAB", "ciclar"),
         ("r", "atualizar"),
         ("q", "sair"),

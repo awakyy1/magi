@@ -38,7 +38,27 @@ pub struct No {
     pub ip: String,
     /// Como a maquina aparece no label `instance` do Prometheus.
     pub prom: String,
+    /// Como a maquina aparece no label de caixa das metricas de banco. Costuma
+    /// divergir do `prom`: os dois nomes mudam em momentos diferentes, e um nao
+    /// deduz o outro. Vazio significa "este no nao hospeda tenant".
+    pub caixa: String,
+    /// Rotulo curto do no na aba CLUSTER, onde a coluna tem tres colunas.
+    pub sigla: String,
     pub papel: String,
+}
+
+/// Nomes de job e de label da instalacao. Sem este bloco a aba CLUSTER nao
+/// existe: a vista por tenant depende de saber como o Prometheus local chama
+/// as coisas, e isso nao da para adivinhar.
+pub struct ClusterCfg {
+    pub job_banco: String,
+    pub job_replica: String,
+    pub job_sonda: String,
+    pub label_tenant: String,
+    pub label_box: String,
+    /// Nome do servico da aplicacao dentro da stack de cada tenant.
+    pub servico_app: String,
+    pub servico_banco: String,
 }
 
 pub struct Config {
@@ -53,7 +73,20 @@ pub struct Config {
     /// GERAL e a altura da aba DIAGRAMA, que e a mais alta.
     pub largura_ideal: u16,
     pub altura_ideal: u16,
+    /// Nos que nao rodam cAdvisor: dizem o motivo em vez de tabela vazia.
+    pub sem_cadvisor: Vec<String>,
+    pub cluster: Option<ClusterCfg>,
     pub nos: Vec<No>,
+}
+
+impl Config {
+    pub fn tem_cluster(&self) -> bool {
+        self.cluster.is_some()
+    }
+
+    pub fn sem_cadvisor(&self, prom: &str) -> bool {
+        self.sem_cadvisor.iter().any(|x| x == prom)
+    }
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -94,6 +127,8 @@ pub fn carregar() -> Result<(), String> {
             ord: u["ord"].as_str().unwrap_or("").to_string(),
             ip: u["ip"].as_str().unwrap_or("").to_string(),
             prom: u["prom"].as_str().unwrap_or("").to_string(),
+            caixa: u["caixa"].as_str().unwrap_or("").to_string(),
+            sigla: u["sigla"].as_str().unwrap_or("").to_string(),
             papel: u["papel"].as_str().unwrap_or("").to_string(),
         })
         .collect();
@@ -106,6 +141,31 @@ pub fn carregar() -> Result<(), String> {
     };
     let num = |chave: &str, padrao: u64| -> u64 { j[chave].as_u64().unwrap_or(padrao) };
 
+    // job_banco e o unico obrigatorio: sem replica ou sem sonda a aba ainda
+    // serve, e as colunas correspondentes ficam vazias
+    let bc = &j["cluster"];
+    let cluster = match bc["job_banco"].as_str() {
+        Some(jb) if !jb.is_empty() => Some(ClusterCfg {
+            job_banco: jb.to_string(),
+            job_replica: bc["job_replica"].as_str().unwrap_or("").to_string(),
+            job_sonda: bc["job_sonda"].as_str().unwrap_or("").to_string(),
+            label_tenant: bc["label_tenant"].as_str().unwrap_or("tenant").to_string(),
+            label_box: bc["label_box"].as_str().unwrap_or("box").to_string(),
+            servico_app: bc["servico_app"].as_str().unwrap_or("").to_string(),
+            servico_banco: bc["servico_banco"].as_str().unwrap_or("").to_string(),
+        }),
+        _ => None,
+    };
+
+    let sem_cadvisor: Vec<String> = j["sem_cadvisor"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let cfg = Config {
         prometheus: std::env::var("MAGI_PROM").unwrap_or_else(|_| texto("prometheus", "")),
         intervalo_host: num("intervalo_host", 1),
@@ -114,6 +174,8 @@ pub fn carregar() -> Result<(), String> {
         prefixo_tenant: texto("prefixo_tenant", ""),
         largura_ideal: num("largura_ideal", 106) as u16,
         altura_ideal: num("altura_ideal", 40) as u16,
+        sem_cadvisor,
+        cluster,
         nos,
     };
     CONFIG.set(cfg).map_err(|_| "configuracao ja carregada".to_string())

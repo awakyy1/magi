@@ -16,6 +16,11 @@ pub struct Amostra {
 
 pub struct Container {
     pub nome: String,
+    /// Nome legivel: task de Swarm vira `stack/servico`.
+    pub curto: String,
+    pub stack: String,
+    pub svc: String,
+    pub swarm: bool,
     pub cpu: f64,
     pub mem: f64,
     pub rx: f64,
@@ -144,15 +149,27 @@ impl Unidade {
         pior
     }
 
-    /// Um container conta como tenant se casa com o prefixo configurado.
+    /// Um container conta como tenant por prefixo ou por servico do Swarm.
+    ///
+    /// No Swarm o nome ganha stack e id de task, entao o teste por prefixo
+    /// deixa de casar: `loja_app.1.<id>` nao comeca com `app_`. Por isso o
+    /// servico extraido da task tambem vale.
     pub fn tenants(&self) -> usize {
         let p = &cfg::get().prefixo_tenant;
-        if p.is_empty() {
+        let svc = cfg::get()
+            .cluster
+            .as_ref()
+            .map(|c| c.servico_app.clone())
+            .unwrap_or_default();
+        if p.is_empty() && svc.is_empty() {
             return 0;
         }
         self.containers
             .iter()
-            .filter(|c| c.nome.starts_with(p.as_str()))
+            .filter(|c| {
+                (!p.is_empty() && c.nome.starts_with(p.as_str()))
+                    || (!svc.is_empty() && c.svc == svc)
+            })
             .count()
     }
 
@@ -322,12 +339,19 @@ impl Unidade {
         nomes.dedup();
         let mut lista: Vec<Container> = nomes
             .into_iter()
-            .map(|n| Container {
-                cpu: *cpu.get(&n).unwrap_or(&0.0),
-                mem: *mem.get(&n).unwrap_or(&0.0),
-                rx: *rx.get(&n).unwrap_or(&0.0),
-                tx: *tx.get(&n).unwrap_or(&0.0),
-                nome: n,
+            .map(|n| {
+                let (curto, stack, svc, swarm) = nome_curto(&n);
+                Container {
+                    cpu: *cpu.get(&n).unwrap_or(&0.0),
+                    mem: *mem.get(&n).unwrap_or(&0.0),
+                    rx: *rx.get(&n).unwrap_or(&0.0),
+                    tx: *tx.get(&n).unwrap_or(&0.0),
+                    nome: n,
+                    curto,
+                    stack,
+                    svc,
+                    swarm,
+                }
             })
             .collect();
         lista.sort_by(|a, b| {
@@ -386,7 +410,7 @@ fn ignora_disco(dev: &str) -> bool {
     dev.starts_with("loop") || dev.starts_with("ram") || dev.starts_with("dm-") || dev.starts_with("sr")
 }
 
-fn agora_epoch() -> f64 {
+pub fn agora_epoch() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -525,6 +549,85 @@ where
     met.iter()
         .find(|m| m.nome == nome && filtro(&m.labels))
         .map(|m| m.valor)
+}
+
+/// Nome de task de servico no Swarm: `<stack>_<servico>.<slot>.<idtask>`.
+///
+/// Em servico global o lugar do slot traz o id do no, nao o numero da replica,
+/// e nesse caso o nome curto ganha `*`. Container que nao e task de Swarm
+/// volta intacto: numa maquina com Swarm ainda sobram containers soltos, como
+/// replicas de banco e exporters. Feito a mao em vez de regex para o binario
+/// nao carregar a crate de regex so por isso.
+pub fn nome_curto(nome: &str) -> (String, String, String, bool) {
+    let simples = || (nome.to_string(), String::new(), String::new(), false);
+    let partes: Vec<&str> = nome.split('.').collect();
+    if partes.len() != 3 {
+        return simples();
+    }
+    let (cabeca, slot, tarefa) = (partes[0], partes[1], partes[2]);
+    let id_valido = |s: &str| s.len() >= 20 && s.chars().all(|c| c.is_ascii_alphanumeric());
+    if !id_valido(tarefa) {
+        return simples();
+    }
+    let slot_num = !slot.is_empty() && slot.chars().all(|c| c.is_ascii_digit());
+    if !slot_num && !id_valido(slot) {
+        return simples();
+    }
+    match cabeca.split_once('_') {
+        Some((stack, svc)) if !stack.is_empty() && !svc.is_empty() => (
+            format!("{}/{}{}", stack, svc, if slot_num { "" } else { "*" }),
+            stack.to_string(),
+            svc.to_string(),
+            true,
+        ),
+        _ => simples(),
+    }
+}
+
+/// Serie com os rotulos preservados. O `prom_query` joga tudo fora menos o
+/// `name`, e a aba CLUSTER precisa de `tenant` e do label de caixa.
+pub struct Serie {
+    pub rotulos: HashMap<String, String>,
+    pub valor: f64,
+}
+
+impl Serie {
+    pub fn rotulo(&self, chave: &str) -> &str {
+        self.rotulos.get(chave).map(|s| s.as_str()).unwrap_or("")
+    }
+}
+
+pub fn prom_series(expr: &str) -> Vec<Serie> {
+    let url = format!(
+        "{}/api/v1/query?query={}",
+        cfg::get().prometheus.clone(),
+        url_encode(expr)
+    );
+    let mut saida = Vec::new();
+    let corpo = match http_get(&url, Duration::from_secs(6)) {
+        Ok(c) => c,
+        Err(_) => return saida,
+    };
+    let json: serde_json::Value = match serde_json::from_str(&corpo) {
+        Ok(v) => v,
+        Err(_) => return saida,
+    };
+    if let Some(res) = json["data"]["result"].as_array() {
+        for s in res {
+            let mut rotulos = HashMap::new();
+            if let Some(m) = s["metric"].as_object() {
+                for (k, v) in m {
+                    if let Some(t) = v.as_str() {
+                        rotulos.insert(k.clone(), t.to_string());
+                    }
+                }
+            }
+            if let Some(v) = s["value"][1].as_str().and_then(|x| x.parse::<f64>().ok()) {
+                saida.push(Serie { rotulos, valor: v });
+            }
+        }
+    }
+    saida
 }
 
 fn prom_query(expr: &str) -> HashMap<String, f64> {

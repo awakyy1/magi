@@ -43,6 +43,10 @@ pub struct Unidade {
     pub ord: String,
     pub ip: String,
     pub prom: String,
+    /// Label de caixa das metricas de banco; vazio se o no nao hospeda tenant.
+    pub caixa: String,
+    /// Rotulo curto do no nas telas onde a coluna e estreita.
+    pub sigla: String,
     pub papel: String,
 
     pub online: bool,
@@ -78,6 +82,8 @@ impl Unidade {
             ord: c.ord.clone(),
             ip: c.ip.clone(),
             prom: c.prom.clone(),
+            caixa: c.caixa.clone(),
+            sigla: c.sigla.clone(),
             papel: c.papel.clone(),
             online: false,
             erro: String::new(),

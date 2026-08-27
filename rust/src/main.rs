@@ -403,7 +403,7 @@ fn rodar_ui(unidades: &Unidades, estado_cluster: &Arc<Mutex<Cluster>>) -> io::Re
                 } else if com_cluster && aba == total_abas - 1 {
                     abas::aba_cluster(f, partes[1], unidades, estado_cluster);
                 } else if aba == unidades.len() + 1 {
-                    abas::aba_diagrama(f, partes[1], unidades);
+                    abas::aba_diagrama(f, partes[1], unidades, estado_cluster);
                 } else {
                     abas::aba_unidade(f, partes[1], &unidades[aba - 1]);
                 }

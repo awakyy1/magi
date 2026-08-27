@@ -920,7 +920,234 @@ pub fn aba_cluster(
 
 // ------------------------------------------------------------ DIAGRAMA ---
 
-pub fn aba_diagrama(f: &mut Frame, area: Rect, unidades: &[Arc<Mutex<Unidade>>]) {
+struct PorNo {
+    sigla: String,
+    tenants: usize,
+    mem: f64,
+    replicas: usize,
+    destino: String,
+    lag: Option<f64>,
+    paradas: usize,
+    mem_usada: f64,
+    mem_total: f64,
+}
+
+/// Tenants, memoria e replicas por no, so com o que a aba CLUSTER ja trouxe.
+fn por_no(linhas: &[Linha], unidades: &[Arc<Mutex<Unidade>>]) -> Vec<PorNo> {
+    let mut saida: Vec<PorNo> = Vec::new();
+    for u in unidades {
+        let g = u.lock().unwrap();
+        let caixa = g.caixa.clone();
+        if caixa.is_empty() {
+            continue;
+        }
+        saida.push(PorNo {
+            sigla: if g.sigla.is_empty() {
+                g.nome.chars().take(3).collect()
+            } else {
+                g.sigla.clone()
+            },
+            tenants: 0,
+            mem: 0.0,
+            replicas: 0,
+            destino: String::new(),
+            lag: None,
+            paradas: 0,
+            mem_usada: g.mem_usada,
+            mem_total: g.mem_total,
+        });
+    }
+    for x in linhas {
+        if let Some(d) = saida.iter_mut().find(|d| d.sigla == x.no) {
+            d.tenants += 1;
+            d.mem += x.app_mem.unwrap_or(0.0) + x.db_mem.unwrap_or(0.0);
+        }
+        if x.rep_existe {
+            if let Some(r) = saida.iter_mut().find(|d| d.sigla == x.no_rep) {
+                r.replicas += 1;
+                r.destino = x.no.clone();
+                if let Some(l) = x.rep_lag {
+                    r.lag = Some(r.lag.map_or(l, |a: f64| a.max(l)));
+                }
+                if !x.rep_ok {
+                    r.paradas += 1;
+                }
+            }
+        }
+    }
+    saida
+}
+
+/// Se um no cair, o parceiro aguenta os tenants dele pela memoria?
+///
+/// A conta e a memoria dos tenants do que caiu somada ao que o parceiro ja
+/// usa, contra o total dele. So faz sentido entre nos que hospedam tenant.
+fn linha_failover<'a>(dados: &[PorNo]) -> Vec<Span<'a>> {
+    let com: Vec<&PorNo> = dados.iter().filter(|d| d.tenants > 0).collect();
+    if com.len() != 2 {
+        return vec![fosco("failover  precisa de dois nos com tenant")];
+    }
+    let mut spans = vec![fosco("failover  ")];
+    for (cai, fica) in [(com[0], com[1]), (com[1], com[0])] {
+        if fica.mem_total <= 0.0 {
+            continue;
+        }
+        let depois = (fica.mem_usada + cai.mem) / fica.mem_total * 100.0;
+        if spans.len() > 1 {
+            spans.push(fosco("  "));
+        }
+        spans.push(Span::styled(
+            format!("{} cai: ", cai.sigla),
+            Style::new().fg(AMBAR),
+        ));
+        spans.push(Span::styled(
+            format!("{} {:.0}%", fica.sigla, depois),
+            Style::new().fg(if depois < TETO_MEM * 100.0 {
+                VERDE
+            } else {
+                LARANJA_FORTE
+            }),
+        ));
+    }
+    spans
+}
+
+fn comp(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// Rodape da aba: o cluster visto por no, e nao tenant por tenant. Responde o
+/// que o diagrama de cima nao responde: como a carga esta dividida, para onde
+/// cada metade replica, e se sobra folga para absorver a queda de um no.
+fn painel_cluster<'a>(
+    cluster: &Arc<Mutex<Cluster>>,
+    unidades: &[Arc<Mutex<Unidade>>],
+    largura: usize,
+) -> Vec<Line<'a>> {
+    let linhas_t: Vec<Linha> = { cluster.lock().unwrap().tenants.clone() };
+    let dados = por_no(&linhas_t, unidades);
+
+    let mut esq: Vec<Vec<Span>> = vec![vec![Span::styled(
+        "CARGA POR NO",
+        Style::new().fg(LARANJA).add_modifier(Modifier::BOLD),
+    )]];
+    let pico = dados.iter().map(|d| d.mem).fold(0.0_f64, f64::max).max(1.0);
+    for d in &dados {
+        let mut l = vec![
+            Span::styled(format!("{:<4} ", d.sigla), Style::new().fg(CIANO)),
+            Span::styled(format!("{:2} tenants  ", d.tenants), Style::new().fg(AMBAR)),
+            Span::styled(
+                format!(
+                    "{:>9}  ",
+                    if d.mem > 0.0 { bytes_h(d.mem) } else { "-".into() }
+                ),
+                Style::new().fg(if d.mem > 0.0 { AMBAR } else { FOSCO }),
+            ),
+        ];
+        l.extend(barra(d.mem / pico * 100.0, 14));
+        esq.push(l);
+    }
+    esq.push(linha_failover(&dados));
+
+    let mut dir: Vec<Vec<Span>> = vec![vec![Span::styled(
+        "REPLICACAO E DISPONIBILIDADE",
+        Style::new().fg(LARANJA).add_modifier(Modifier::BOLD),
+    )]];
+    for d in &dados {
+        let mut l = vec![Span::styled(
+            format!("{:<4} ", d.sigla),
+            Style::new().fg(CIANO),
+        )];
+        if d.replicas == 0 {
+            l.push(fosco("nao guarda replica"));
+        } else {
+            l.push(Span::styled(
+                format!("guarda {} de {}  ", d.replicas, d.destino),
+                Style::new().fg(AMBAR),
+            ));
+            if d.paradas > 0 {
+                l.push(Span::styled(
+                    format!("{} PARADAS", d.paradas),
+                    Style::new().fg(VERMELHO).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                l.push(Span::styled(
+                    format!("lag {}s", d.lag.unwrap_or(0.0) as i64),
+                    Style::new().fg(VERDE),
+                ));
+            }
+        }
+        dir.push(l);
+    }
+
+    let blocos: Vec<f64> = linhas_t.iter().flat_map(|x| x.hist.clone()).collect();
+    let caidos: Vec<String> = linhas_t
+        .iter()
+        .filter(|x| x.hist.iter().any(|v| *v < 1.0))
+        .map(|x| x.tenant.clone())
+        .collect();
+    let mut l = vec![fosco(format!("{}min  ", cfg::get().janela_sonda))];
+    if blocos.is_empty() {
+        l.push(fosco("sem historico ainda"));
+    } else {
+        let pct = blocos.iter().filter(|v| **v >= 1.0).count() as f64 / blocos.len() as f64
+            * 100.0;
+        l.push(Span::styled(
+            format!("{:.2}%", pct),
+            Style::new().fg(if pct >= 99.9 { VERDE } else { LARANJA_FORTE }),
+        ));
+        l.push(fosco("  "));
+        if caidos.is_empty() {
+            l.push(Span::styled("sem oscilacao", Style::new().fg(VERDE)));
+        } else {
+            l.push(Span::styled(
+                format!("oscilou {}", caidos[..caidos.len().min(2)].join(", ")),
+                Style::new().fg(LARANJA_FORTE),
+            ));
+            if caidos.len() > 2 {
+                l.push(fosco(format!(" +{}", caidos.len() - 2)));
+            }
+        }
+    }
+    dir.push(l);
+
+    // a caixa e desenhada a mao porque a aba inteira e um Paragraph so: um
+    // Block aqui dentro exigiria outro render_widget e outra area
+    let interno = largura.saturating_sub(4);
+    let meia = interno.saturating_sub(3) / 2;
+    let borda = Style::new().fg(FOSCO);
+    let mut saida = vec![Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(largura.saturating_sub(2))),
+        borda,
+    ))];
+    for i in 0..esq.len().max(dir.len()) {
+        let mut spans = vec![Span::styled("│ ", borda)];
+        let e = esq.get(i).cloned().unwrap_or_default();
+        let usado = comp(&e);
+        spans.extend(e);
+        spans.push(Span::raw(" ".repeat(meia.saturating_sub(usado) + 3)));
+        let d = dir.get(i).cloned().unwrap_or_default();
+        let usado_d = comp(&d);
+        spans.extend(d);
+        spans.push(Span::raw(
+            " ".repeat(interno.saturating_sub(meia + 3 + usado_d)),
+        ));
+        spans.push(Span::styled(" │", borda));
+        saida.push(Line::from(spans));
+    }
+    saida.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(largura.saturating_sub(2))),
+        borda,
+    )));
+    saida
+}
+
+pub fn aba_diagrama(
+    f: &mut Frame,
+    area: Rect,
+    unidades: &[Arc<Mutex<Unidade>>],
+    cluster: &Arc<Mutex<Cluster>>,
+) {
     // borda arredondada e respiro interno, como o Panel do rich: sem eles o
     // titulo encosta na moldura e a aba fica com outra cara
     let b = Block::default()
@@ -948,8 +1175,9 @@ pub fn aba_diagrama(f: &mut Frame, area: Rect, unidades: &[Arc<Mutex<Unidade>>])
         linhas.push(Line::from(spans));
     }
 
+    // sem titulo em cima da tabela: o cabecalho das colunas ja diz o que e,
+    // e a linha solta ficava sobrando na tela
     linhas.push(Line::from(""));
-    linhas.push(Line::from(fosco("latencia ate cada unidade (tailnet)")));
 
     let corpo: Vec<Vec<Cel>> = unidades
         .iter()
@@ -993,6 +1221,10 @@ pub fn aba_diagrama(f: &mut Frame, area: Rect, unidades: &[Arc<Mutex<Unidade>>])
         corpo,
         largura,
     ));
+
+    if cfg::get().tem_cluster() {
+        linhas.extend(painel_cluster(cluster, unidades, largura));
+    }
 
     f.render_widget(Paragraph::new(linhas), dentro);
 }

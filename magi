@@ -73,6 +73,15 @@ ALTURA_IDEAL = CONFIG.get('altura_ideal', 40)
 
 UNIDADES = CONFIG['unidades']
 
+# unidades sem cAdvisor: aparecem sem tabela de container, com o motivo dito
+# na tela em vez de um painel vazio que parece defeito
+SEM_CADVISOR = tuple(CONFIG.get('sem_cadvisor', []))
+
+# bloco opcional. Sem ele a aba CLUSTER nao aparece: a vista por tenant
+# depende de saber o nome dos jobs no Prometheus, e isso e de cada instalacao
+CLUSTER = CONFIG.get('cluster') or {}
+TEM_CLUSTER = bool(CLUSTER.get('job_banco'))
+
 COLETORES = ('cpu', 'meminfo', 'filesystem', 'netdev', 'diskstats',
              'loadavg', 'time', 'stat')
 
@@ -330,8 +339,13 @@ class Unidade:
         mm = {n: m_rss.get(n, 0.0) + m_cache.get(n, 0.0)
               for n in set(m_rss) | set(m_cache)}
         nomes = set(mc) | set(mm)
-        lista = [{'nome': n, 'cpu': mc.get(n, 0.0), 'mem': mm.get(n, 0.0),
-                  'rx': mr.get(n, 0.0), 'tx': mt.get(n, 0.0)} for n in nomes]
+        lista = []
+        for n in nomes:
+            curto, stack, svc, swarm = nome_curto(n)
+            lista.append({'nome': n, 'curto': curto, 'stack': stack,
+                          'svc': svc, 'swarm': swarm,
+                          'cpu': mc.get(n, 0.0), 'mem': mm.get(n, 0.0),
+                          'rx': mr.get(n, 0.0), 'tx': mt.get(n, 0.0)})
         lista.sort(key=lambda c: (-c['cpu'], -c['mem']))
         with self.lock:
             self.containers = lista
@@ -380,9 +394,152 @@ def dur_h(seg):
     return '%02dh %02dm' % (h, m)
 
 
+# nome de task de servico no Swarm: <stack>_<servico>.<slot>.<idtask>
+# em servico global o lugar do slot traz o id do no, nao o numero da replica
+TASK_SWARM = re.compile(
+    r'^(?P<stack>[a-z0-9][a-z0-9-]*)_(?P<svc>[a-z0-9][a-z0-9_-]*?)'
+    r'\.(?P<slot>\d+|[a-z0-9]{20,})\.(?P<task>[a-z0-9]{20,})$')
+
+
+def nome_curto(nome):
+    """'loja_app.1.gcfii3yh..' -> ('loja/app', 'loja', 'app', True).
+
+    Container que nao e task de Swarm volta com o nome intacto e swarm=False:
+    numa maquina que roda Swarm ainda sobram containers soltos, como replicas
+    de banco e exporters.
+    """
+    m = TASK_SWARM.match(nome)
+    if not m:
+        return nome, '', '', False
+    stack, svc, slot = m.group('stack'), m.group('svc'), m.group('slot')
+    marca = '' if slot.isdigit() else '*'
+    return '%s/%s%s' % (stack, svc, marca), stack, svc, True
+
+
 def _e_tenant(container):
-    """Um container conta como tenant se casa com o prefixo configurado."""
-    return bool(PREFIXO_TENANT) and container['nome'].startswith(PREFIXO_TENANT)
+    """Um container conta como tenant por prefixo ou por servico do Swarm.
+
+    No Swarm o nome ganha stack e id de task, entao o teste por prefixo deixa
+    de casar: loja_app.1.<id> nao comeca com 'app_'. Por isso o servico
+    extraido da task tambem vale.
+    """
+    if PREFIXO_TENANT and container['nome'].startswith(PREFIXO_TENANT):
+        return True
+    svc = CLUSTER.get('servico_app')
+    return bool(svc) and container.get('svc') == svc
+
+
+class Cluster:
+    """Visao por tenant, montada so com consultas ao Prometheus.
+
+    Os nomes de job e de label vem da configuracao porque variam por
+    instalacao. Nao usa metrica swarm_*: o dockerd so expoe isso se a
+    instalacao ligar metrics-addr, o que exige reiniciar o daemon.
+    """
+
+    def __init__(self, unidades):
+        self.lock = threading.Lock()
+        self.unidades = unidades
+        self.tenants = []
+        self.erro = ''
+        self.atualizado = 0.0
+        self.job_banco = CLUSTER.get('job_banco', '')
+        self.job_replica = CLUSTER.get('job_replica', '')
+        self.job_sonda = CLUSTER.get('job_sonda', '')
+        self.l_tenant = CLUSTER.get('label_tenant', 'tenant')
+        self.l_box = CLUSTER.get('label_box', 'box')
+        self.svc_app = CLUSTER.get('servico_app', '')
+        self.svc_banco = CLUSTER.get('servico_banco', '')
+
+    def _sigla(self, caixa):
+        for u in self.unidades:
+            if caixa and getattr(u, 'caixa', '') == caixa:
+                return getattr(u, 'sigla', u.nome[:3])
+        return '?'
+
+    def coletar(self):
+        if not TEM_CLUSTER:
+            return
+        prim = prom_query('mysql_up{job="%s"}' % self.job_banco)
+        if not prim:
+            with self.lock:
+                self.erro = 'sem resposta do Prometheus'
+            return
+        rep_io = rep_sql = rep_lag = []
+        if self.job_replica:
+            rep_io = prom_query('mysql_slave_status_slave_io_running'
+                                '{job="%s"}' % self.job_replica)
+            rep_sql = prom_query('mysql_slave_status_slave_sql_running'
+                                 '{job="%s"}' % self.job_replica)
+            rep_lag = prom_query('mysql_slave_status_seconds_behind_master'
+                                 '{job="%s"}' % self.job_replica)
+        sonda = atraso = []
+        if self.job_sonda:
+            sonda = prom_query('probe_success{job="%s"}' % self.job_sonda)
+            atraso = prom_query('probe_duration_seconds{job="%s"}'
+                                % self.job_sonda)
+
+        def vals(res, chave):
+            return {x['metric'].get(chave, '?'): float(x['value'][1])
+                    for x in res}
+
+        v_prim = vals(prim, self.l_tenant)
+        v_io = vals(rep_io, self.l_tenant)
+        v_sql = vals(rep_sql, self.l_tenant)
+        v_lag = vals(rep_lag, self.l_tenant)
+        # a sonda e por alvo, e nela o tenant costuma vir no proprio instance
+        v_sonda = vals(sonda, 'instance')
+        v_atraso = vals(atraso, 'instance')
+        caixa_prim = {x['metric'].get(self.l_tenant):
+                      x['metric'].get(self.l_box, '') for x in prim}
+        caixa_rep = {x['metric'].get(self.l_tenant):
+                     x['metric'].get(self.l_box, '') for x in rep_io}
+
+        # o consumo vem do que o laco de containers ja coletou, sem consulta
+        # nova; sem servico configurado as colunas ficam vazias e a aba ainda
+        # serve para site e replica
+        uso = {}
+        servicos = tuple(x for x in (self.svc_app, self.svc_banco) if x)
+        for u in self.unidades:
+            with u.lock:
+                for c in u.containers:
+                    if c['stack'] and servicos and c['svc'] in servicos:
+                        uso[(c['stack'], c['svc'])] = c
+
+        linhas = []
+        for tenant in sorted(v_prim):
+            g = uso.get((tenant, self.svc_app), {}) if self.svc_app else {}
+            d = uso.get((tenant, self.svc_banco), {}) if self.svc_banco else {}
+            tem_rep = tenant in v_io
+            linhas.append({
+                'tenant': tenant,
+                'no': self._sigla(caixa_prim.get(tenant, '')),
+                'no_rep': self._sigla(caixa_rep.get(tenant, '')) if tem_rep else '-',
+                'db_up': v_prim.get(tenant, 0.0) >= 1,
+                'site': v_sonda.get(tenant),
+                'latencia': v_atraso.get(tenant),
+                'app_cpu': g.get('cpu'), 'app_mem': g.get('mem'),
+                'db_cpu': d.get('cpu'), 'db_mem': d.get('mem'),
+                'tem_task': bool(g),
+                'rep': (tem_rep,
+                        v_io.get(tenant, 0.0) >= 1 and v_sql.get(tenant, 0.0) >= 1,
+                        v_lag.get(tenant)),
+            })
+        with self.lock:
+            self.tenants = linhas
+            self.erro = ''
+            self.atualizado = time.time()
+
+    def resumo(self):
+        with self.lock:
+            t = list(self.tenants)
+        lags = [x['rep'][2] for x in t if x['rep'][2] is not None]
+        return {'total': len(t),
+                'no_ar': sum(1 for x in t if x['site'] == 1.0),
+                'replicando': sum(1 for x in t if x['rep'][0] and x['rep'][1]),
+                'lag_max': max(lags) if lags else None,
+                'sem_replica': [x['tenant'] for x in t if not x['rep'][0]],
+                'fora': [x['tenant'] for x in t if x['site'] == 0.0]}
 
 
 def cor_por_valor(pct):
@@ -1055,7 +1212,7 @@ def aba_unidade(u):
 
     tab = Table(expand=True, border_style=FOSCO, header_style='bold %s' % LARANJA,
                 title_style='bold %s' % AMBAR)
-    tab.add_column('CONTAINER', style=AMBAR, no_wrap=True)
+    tab.add_column('TASK / CONTAINER', style=AMBAR, no_wrap=True)
     tab.add_column('CPU%', justify='right', width=8)
     tab.add_column('MEM', justify='right', width=10)
     tab.add_column('USO', justify='left', width=14)
@@ -1063,21 +1220,34 @@ def aba_unidade(u):
     tab.add_column('TX/s', justify='right', width=10)
 
     if not containers:
-        tab.add_row('sem dados do Prometheus' if online else 'unidade offline',
-                    '-', '-', '', '-', '-')
+        if u.prom in SEM_CADVISOR:
+            motivo = 'sem cAdvisor nesta unidade, nao ha metrica de container'
+        elif not online:
+            motivo = 'unidade offline'
+        else:
+            motivo = 'sem dados do Prometheus'
+        tab.add_row(Text(motivo, style=FOSCO), '-', '-', '', '-', '-')
     else:
         pico = max((c['mem'] for c in containers), default=1) or 1
         for c in containers:
             pct_cpu = c['cpu']
             tab.add_row(
-                c['nome'],
+                Text(c['curto'], style=AMBAR if c['swarm'] else FOSCO),
                 Text('%.1f' % pct_cpu, style=cor_por_valor(pct_cpu)),
                 Text(bytes_h(c['mem']), style=AMBAR),
                 barra(c['mem'] / pico * 100, 12),
                 Text(bytes_h(c['rx']) if c['rx'] else '-', style=CIANO),
                 Text(bytes_h(c['tx']) if c['tx'] else '-', style=CIANO),
             )
-    return Group(cabecalho, Text(''), tab)
+    legenda = Text()
+    n_swarm = sum(1 for c in containers if c['swarm'])
+    if n_swarm:
+        legenda.append('  tasks de swarm ', style=FOSCO)
+        legenda.append(str(n_swarm), style=AMBAR)
+        legenda.append('   containers soltos ', style=FOSCO)
+        legenda.append(str(len(containers) - n_swarm), style=AMBAR)
+        legenda.append('   * = servico global', style=FOSCO)
+    return Group(cabecalho, Text(''), tab, legenda)
 
 
 def cor_latencia(ms):
@@ -1120,6 +1290,215 @@ def tabela_latencia(unidades):
     return tab
 
 
+def estado_tenant(x):
+    """Cor unica do tenant, tirada do pior sinal entre site, banco e replica."""
+    if x['site'] == 0.0 or not x['db_up']:
+        return VERMELHO
+    if not x['rep'][0] or not x['rep'][1]:
+        return LARANJA_FORTE
+    lag = x['rep'][2]
+    if lag is not None and lag >= 60:
+        return LARANJA_FORTE
+    if x['site'] is None or not x['tem_task']:
+        return FOSCO
+    return VERDE
+
+
+def largura_terminal(padrao=LARGURA_IDEAL):
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return padrao
+
+
+def _cel_pct(v):
+    return Text('-', style=FOSCO) if v is None else \
+        Text('%.1f' % v, style=cor_por_valor(v))
+
+
+def _cel_bytes(v):
+    return Text('-', style=FOSCO) if v is None else \
+        Text(bytes_h(v), style=AMBAR)
+
+
+def pico_cpu(linhas):
+    """Escala comum das barras: sem isso os nos ficam incomparaveis."""
+    return max(((x['app_cpu'] or 0) + (x['db_cpu'] or 0) for x in linhas),
+               default=0) or 1.0
+
+
+def tabela_tenants(linhas, titulo, larg_barra=10, pico=None, mostrar_no=True):
+    # rotulo curto e fixo: cortar o nome do servico em 5 letras produzia
+    # cabecalho feio ('mariadb' virava 'MARIA'). O nome completo do servico
+    # aparece na aba da unidade, no nome da task
+    rot_app, rot_db = 'APP', 'DB'
+    tab = Table(expand=True, border_style=FOSCO, box=None,
+                header_style='bold %s' % LARANJA, title=titulo,
+                title_style='bold %s' % AMBAR, pad_edge=False, padding=(0, 1))
+    tab.add_column('TENANT', style=AMBAR, no_wrap=True, width=13)
+    if mostrar_no:
+        tab.add_column('NO', justify='center', width=3)
+    tab.add_column('SITE', justify='center', width=4)
+    tab.add_column('ms', justify='right', width=4)
+    tab.add_column(rot_app, justify='right', width=5)
+    tab.add_column('MEM', justify='right', width=7)
+    tab.add_column(rot_db, justify='right', width=5)
+    tab.add_column('MEM', justify='right', width=7)
+    tab.add_column('REPL', justify='left', width=8)
+    # ultima coluna elastica de proposito: absorve a sobra de largura em vez
+    # de deixar um vao entre TENANT e o resto
+    tab.add_column('CPU', justify='left', ratio=1, min_width=8)
+
+    if not linhas:
+        tab.add_row(Text('sem dados', style=FOSCO),
+                    *[''] * (9 if mostrar_no else 8))
+        return tab
+
+    if pico is None:
+        pico = pico_cpu(linhas)
+
+    for x in linhas:
+        cor = estado_tenant(x)
+        if x['site'] is None:
+            site = Text('?', style=FOSCO)
+        elif x['site'] == 1.0:
+            site = Text('UP', style=VERDE)
+        else:
+            site = Text('OFF', style=VERMELHO)
+        ms = (Text('%d' % (x['latencia'] * 1000), style=AMBAR)
+              if x['latencia'] is not None else Text('-', style=FOSCO))
+        tem, ok, lag = x['rep']
+        if not tem:
+            repl = Text('ausente', style=VERMELHO)
+        elif not ok:
+            repl = Text('%s PARADA' % x['no_rep'], style=VERMELHO)
+        elif lag is None:
+            repl = Text('%s ok' % x['no_rep'], style=VERDE)
+        else:
+            cor_lag = (VERDE if lag < 30 else
+                       LARANJA_FORTE if lag < 300 else VERMELHO)
+            repl = Text('%s %ds' % (x['no_rep'], int(lag)), style=cor_lag)
+
+        celulas = [Text('%s %s' % ('●' if cor == VERDE else '○',
+                                   x['tenant'][:11]), style=cor)]
+        if mostrar_no:
+            celulas.append(Text(x['no'], style=CIANO))
+        soma_cpu = (x['app_cpu'] or 0) + (x['db_cpu'] or 0)
+        tab.add_row(*celulas + [
+            site, ms,
+            _cel_pct(x['app_cpu']), _cel_bytes(x['app_mem']),
+            _cel_pct(x['db_cpu']), _cel_bytes(x['db_mem']),
+            repl,
+            barra(soma_cpu / pico * 100, larg_barra),
+        ])
+    return tab
+
+
+def painel_resumo_cluster(cluster, unidades):
+    r = cluster.resumo()
+    with cluster.lock:
+        erro, quando = cluster.erro, cluster.atualizado
+    tasks = sum(1 for u in unidades for c in u.containers if c['swarm'])
+    servicos = len({(c['stack'], c['svc']) for u in unidades
+                    for c in u.containers if c['swarm']})
+    soltos = sum(1 for u in unidades for c in u.containers if not c['swarm'])
+
+    esq, dir_ = [], []
+    t = Text()
+    t.append('tenants    ', style=FOSCO)
+    t.append('%d' % r['total'], style=AMBAR)
+    t.append('   no ar ', style=FOSCO)
+    inteiro = r['total'] and r['no_ar'] == r['total']
+    t.append('%d/%d' % (r['no_ar'], r['total']),
+             style='bold %s' % (VERDE if inteiro else VERMELHO))
+    esq.append(t)
+    t = Text()
+    t.append('replicando ', style=FOSCO)
+    todas = r['total'] and r['replicando'] == r['total']
+    t.append('%d/%d' % (r['replicando'], r['total']),
+             style='bold %s' % (VERDE if todas else LARANJA_FORTE))
+    t.append('   lag max ', style=FOSCO)
+    if r['lag_max'] is None:
+        t.append('-', style=FOSCO)
+    else:
+        t.append('%ds' % int(r['lag_max']),
+                 style=VERDE if r['lag_max'] < 30 else LARANJA_FORTE)
+    esq.append(t)
+
+    t = Text()
+    t.append('servicos   ', style=FOSCO)
+    t.append(str(servicos), style=AMBAR)
+    t.append('   tasks ', style=FOSCO)
+    t.append(str(tasks), style=AMBAR)
+    t.append('   soltos ', style=FOSCO)
+    t.append(str(soltos), style=AMBAR)
+    dir_.append(t)
+    t = Text()
+    t.append('veredito   ', style=FOSCO)
+    if erro:
+        t.append(erro.upper(), style='bold %s' % VERMELHO)
+    elif r['fora']:
+        t.append('FORA DO AR: %s' % ', '.join(r['fora']),
+                 style='bold %s' % VERMELHO)
+    elif r['sem_replica']:
+        t.append('SEM REPLICA: %s' % ', '.join(r['sem_replica']),
+                 style='bold %s' % LARANJA_FORTE)
+    elif r['total']:
+        t.append('CLUSTER INTEGRO', style='bold %s' % VERDE)
+    else:
+        t.append('COLETANDO', style=FOSCO)
+    dir_.append(t)
+    if quando:
+        t = Text()
+        t.append('coleta     ', style=FOSCO)
+        t.append(time.strftime('%H:%M:%S', time.localtime(quando)), style=FOSCO)
+        dir_.append(t)
+
+    grid = Table.grid(expand=True, padding=(0, 2))
+    grid.add_column(ratio=1)
+    grid.add_column(ratio=1)
+    grid.add_row(Group(*esq), Group(*dir_))
+    return Panel(grid, border_style=FOSCO, padding=(0, 1),
+                 title='[%s]CLUSTER[/]' % LARANJA, title_align='left')
+
+
+def aba_cluster(cluster, unidades):
+    with cluster.lock:
+        linhas = list(cluster.tenants)
+    topo = painel_resumo_cluster(cluster, unidades)
+
+    # em terminal largo divide por no, que e o que mostra balanceamento;
+    # em terminal estreito uma tabela so, senao as colunas somem
+    com_caixa = [u for u in unidades if getattr(u, 'caixa', '')]
+    if largura_terminal() >= 156 and linhas and len(com_caixa) > 1:
+        grid = Table.grid(expand=True, padding=(0, 2))
+        grid.add_column(ratio=1)
+        grid.add_column(ratio=1)
+        siglas = [getattr(u, 'sigla', u.nome[:3]) for u in com_caixa]
+        pico = pico_cpu(linhas)
+        larg_b = max(8, min(24, (largura_terminal() - 160) // 2 + 8))
+        blocos = []
+        for sig in siglas:
+            desta = [x for x in linhas if x['no'] == sig]
+            blocos.append(tabela_tenants(
+                desta, '%s · %d TENANTS' % (sig, len(desta)), larg_b, pico,
+                mostrar_no=False))
+        orfaos = [x for x in linhas if x['no'] not in siglas]
+        if orfaos:
+            blocos.append(tabela_tenants(orfaos, 'SEM NO IDENTIFICADO',
+                                         larg_b, pico))
+        while len(blocos) % 2:
+            blocos.append(Text(''))
+        for i in range(0, len(blocos), 2):
+            grid.add_row(blocos[i], blocos[i + 1])
+        corpo = grid
+    else:
+        corpo = tabela_tenants(
+            sorted(linhas, key=lambda x: (x['no'], x['tenant'])), 'TENANTS',
+            max(8, min(48, largura_terminal() - 82)))
+    return Group(topo, Text(''), corpo)
+
+
 def aba_diagrama(unidades):
     """Diagrama triangular das tres unidades, no estilo da tela do MAGI
     quando o sistema e atacado no anime: cada no e o seu proprio selo, sem
@@ -1149,6 +1528,8 @@ def cabecalho(aba, unidades):
 
     meio = Text()
     nomes = ['GERAL'] + [u.nome for u in unidades] + ['DIAGRAMA']
+    if TEM_CLUSTER:
+        nomes.append('CLUSTER')
     for i, nome in enumerate(nomes):
         if i == aba:
             meio.append(' %d %s ' % (i + 1, nome), style='bold black on %s' % AMBAR)
@@ -1164,7 +1545,8 @@ def cabecalho(aba, unidades):
 
 def rodape():
     t = Text()
-    for tecla, desc in (('1-5', 'abas'), ('TAB', 'ciclar'), ('r', 'atualizar'),
+    for tecla, desc in (('1-6' if TEM_CLUSTER else '1-5', 'abas'),
+                        ('TAB', 'ciclar'), ('r', 'atualizar'),
                         ('q', 'sair')):
         t.append(' %s ' % tecla, style='bold black on %s' % FOSCO)
         t.append(' %s   ' % desc, style=FOSCO)
@@ -1193,7 +1575,7 @@ def _tenta(fn):
         pass
 
 
-def laco_containers(unidades, parar):
+def laco_containers(unidades, cluster, parar):
     while not parar.is_set():
         threads = [threading.Thread(target=_tenta, args=(u.coletar_containers,),
                                     daemon=True) for u in unidades]
@@ -1201,6 +1583,7 @@ def laco_containers(unidades, parar):
             t.start()
         for t in threads:
             t.join(timeout=8.0)
+        _tenta(cluster.coletar)
         parar.wait(INTERVALO_CONTAINER)
 
 
@@ -1287,6 +1670,7 @@ def tela_boot(console, unidades):
 def main():
     console = Console()
     unidades = [Unidade(c) for c in UNIDADES]
+    cluster = Cluster(unidades)
 
     # antes do boot, nao depois: assim o logo e a checagem ja aparecem na
     # geometria final e nao ha um salto de tamanho ao entrar no painel
@@ -1305,11 +1689,12 @@ def main():
 
     parar = threading.Event()
     threading.Thread(target=laco_host, args=(unidades, parar), daemon=True).start()
-    threading.Thread(target=laco_containers, args=(unidades, parar),
+    threading.Thread(target=laco_containers, args=(unidades, cluster, parar),
                      daemon=True).start()
 
     aba = 0
-    total_abas = 2 + len(unidades)  # GERAL + uma por unidade + DIAGRAMA
+    # GERAL + uma por unidade + DIAGRAMA, e CLUSTER so se houver config
+    total_abas = 2 + len(unidades) + (1 if TEM_CLUSTER else 0)
     fd = sys.stdin.fileno()
     antigo = termios.tcgetattr(fd)
     try:
@@ -1337,15 +1722,15 @@ def main():
                         aba = (aba - 1) % total_abas
                     elif tecla in ('r', 'R'):
                         for u in unidades:
-                            try:
-                                u.coletar_containers()
-                            except Exception:
-                                pass
+                            _tenta(u.coletar_containers)
+                        _tenta(cluster.coletar)
 
                 layout['topo'].update(cabecalho(aba, unidades))
                 if aba == 0:
                     layout['corpo'].update(aba_geral(unidades))
-                elif aba == total_abas - 1:
+                elif TEM_CLUSTER and aba == total_abas - 1:
+                    layout['corpo'].update(aba_cluster(cluster, unidades))
+                elif aba == 1 + len(unidades):
                     layout['corpo'].update(aba_diagrama(unidades))
                 else:
                     layout['corpo'].update(

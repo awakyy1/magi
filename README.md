@@ -19,13 +19,53 @@ interesting part of the project. More on that below.
 
 ![Overview tab](docs/2-geral.png)
 
-Five tabs, all driven by live data:
+Five tabs, all driven by live data, plus a sixth when you configure it:
 
 | Tab | What it shows |
 |---|---|
 | `GERAL` | all nodes side by side, plus the verdict (see below) |
 | one per node | host detail and the container table, sorted by CPU |
 | `DIAGRAMA` | the MAGI status screen, with each node's bottleneck |
+| `CLUSTER` | one row per tenant: which node runs it, HTTP probe, app and database usage, replica state and lag (see below) |
+
+### The tenant view
+
+Node-shaped monitoring answers *"is the machine healthy?"*. When a machine
+hosts many independent tenants, that is the wrong unit: a node at 15% CPU can
+still have one tenant down. The `CLUSTER` tab turns the same data sideways and
+gives one row per tenant.
+
+It is off by default because it needs to know your Prometheus job names, which
+are specific to your setup. Add a `cluster` block to the config and the tab
+appears:
+
+```json
+"cluster": {
+  "job_banco": "mysql",
+  "job_replica": "mysql_replica",
+  "job_sonda": "blackbox_app",
+  "label_tenant": "tenant",
+  "label_box": "box",
+  "servico_app": "app",
+  "servico_banco": "db"
+}
+```
+
+Only `job_banco` is required; drop `job_replica` or `job_sonda` and those
+columns simply stay empty. To place tenants on nodes, give each node a `caixa`
+(the value your database metrics carry in the `label_box` label) and a short
+`sigla`. From 156 columns wide the tab splits per node side by side, which is
+the view that shows imbalance.
+
+The CPU bar uses one scale across all nodes on purpose. A per-table scale
+makes every node look equally busy.
+
+### Swarm task names
+
+Under Docker Swarm a container is named `<stack>_<service>.<slot>.<taskid>`,
+which is 40 characters of noise in a table. The node tabs shorten that to
+`stack/service`, and a global service gets a `*` because there is no replica
+number to show. Containers that are not Swarm tasks keep their name, dimmed.
 
 ### The verdict
 
@@ -170,7 +210,7 @@ cd rust && cargo build --release
 
 | Key | Action |
 |---|---|
-| `1`–`5`, arrows | switch tab |
+| `1`–`5` (`1`–`6` with the cluster tab), arrows | switch tab |
 | `TAB` | cycle tabs |
 | `r` | force a container refresh |
 | `q` | quit |
@@ -185,6 +225,10 @@ disables the window resize request.
 - Optionally a Prometheus scraping cAdvisor, for the container table and for
   seeding the history graphs. Without it the tool still works; the container
   tab is just empty and the graphs start from zero.
+- For the `CLUSTER` tab, a Prometheus with a database exporter per tenant and,
+  if you want the site column, a blackbox probe per tenant. List nodes that do
+  not run cAdvisor under `sem_cadvisor` and they say so instead of showing an
+  empty table.
 
 ---
 

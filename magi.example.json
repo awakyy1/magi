@@ -7,6 +7,20 @@
 
   "prefixo_tenant": "app_",
 
+  "//": "unidades sem cAdvisor: dizem o motivo em vez de tabela vazia",
+  "sem_cadvisor": [],
+
+  "//cluster": "bloco opcional. Sem ele a aba CLUSTER nao aparece. Os nomes de job e de label sao os do seu Prometheus; servico_app e servico_banco sao os nomes dos servicos do Swarm dentro de cada stack de tenant",
+  "cluster": {
+    "job_banco": "mysql",
+    "job_replica": "mysql_replica",
+    "job_sonda": "blackbox_app",
+    "label_tenant": "tenant",
+    "label_box": "box",
+    "servico_app": "app",
+    "servico_banco": "db"
+  },
+
   "largura_ideal": 106,
   "altura_ideal": 40,
 
@@ -16,6 +30,8 @@
       "ord": "01",
       "ip": "10.0.0.11",
       "prom": "node-01",
+      "caixa": "node-01-box",
+      "sigla": "N01",
       "papel": "NODE-01 / WEB"
     },
     {
@@ -23,6 +39,8 @@
       "ord": "02",
       "ip": "10.0.0.12",
       "prom": "node-02",
+      "caixa": "node-02-box",
+      "sigla": "N02",
       "papel": "NODE-02 / APP"
     },
     {

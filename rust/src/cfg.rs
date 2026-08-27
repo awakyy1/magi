@@ -173,7 +173,9 @@ pub fn carregar() -> Result<(), String> {
     let cfg = Config {
         prometheus: std::env::var("MAGI_PROM").unwrap_or_else(|_| texto("prometheus", "")),
         intervalo_host: num("intervalo_host", 1),
-        intervalo_container: num("intervalo_container", 5),
+        // coletar mais rapido que o scrape do Prometheus nao cria dado novo,
+        // so encurta a espera entre o scrape chegar e a tela mostrar
+        intervalo_container: num("intervalo_container", 3),
         historico: num("historico", 60) as usize,
         prefixo_tenant: texto("prefixo_tenant", ""),
         largura_ideal: num("largura_ideal", 106) as u16,

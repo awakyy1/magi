@@ -323,6 +323,10 @@ impl Unidade {
     /// A parte de rede dos containers, tambem fora do mutex.
     pub fn buscar_containers(prom: &str) -> Vec<Container> {
         let i = prom;
+        // irate com janela de 1min, nao rate de 2min: com scrape de 15s o
+        // rate[2m] era media de 8 amostras, e um pico levava dois minutos
+        // para aparecer e sumir. irate usa as duas amostras mais recentes,
+        // entao o numero muda a cada scrape
         // so containers vistos agora. Quando uma task e recriada, a serie da
         // antiga fica no Prometheus por mais 5 min: sem este filtro o tenant
         // aparecia duas vezes e o consumo podia sair da task morta, com 0%
@@ -333,7 +337,7 @@ impl Unidade {
             i, FRESCURA_CONTAINER
         );
         let cpu = prom_query(&(format!(
-            "sum by (name) (rate(container_cpu_usage_seconds_total{{instance=\"{}\",name!=\"\"}}[2m])) * 100",
+            "sum by (name) (irate(container_cpu_usage_seconds_total{{instance=\"{}\",name!=\"\"}}[1m])) * 100",
             i
         ) + &vivo));
         let mem = prom_query(&(format!(
@@ -341,11 +345,11 @@ impl Unidade {
             i
         ) + &vivo));
         let rx = prom_query(&(format!(
-            "sum by (name) (rate(container_network_receive_bytes_total{{instance=\"{}\",name!=\"\"}}[2m]))",
+            "sum by (name) (irate(container_network_receive_bytes_total{{instance=\"{}\",name!=\"\"}}[1m]))",
             i
         ) + &vivo));
         let tx = prom_query(&(format!(
-            "sum by (name) (rate(container_network_transmit_bytes_total{{instance=\"{}\",name!=\"\"}}[2m]))",
+            "sum by (name) (irate(container_network_transmit_bytes_total{{instance=\"{}\",name!=\"\"}}[1m]))",
             i
         ) + &vivo));
 

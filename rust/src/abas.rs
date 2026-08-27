@@ -24,7 +24,7 @@ fn fosco<'a>(s: impl Into<String>) -> Span<'a> {
 //
 // O `Table` do ratatui nao desenha separador entre colunas e estica pra
 // altura toda que recebe. A versao em Python usa a caixa padrao do rich, que
-// tem cabecalho pesado e regua entre as colunas — entao aqui a tabela e
+// tem cabecalho pesado e regua entre as colunas - entao aqui a tabela e
 // montada a mao, pras duas versoes ficarem iguais.
 
 pub struct Cel<'a> {

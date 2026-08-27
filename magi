@@ -58,7 +58,9 @@ if CONFIG is None:
 
 PROM = os.environ.get('MAGI_PROM') or CONFIG.get('prometheus', '')
 INTERVALO_HOST = CONFIG.get('intervalo_host', 1.0)
-INTERVALO_CONTAINER = CONFIG.get('intervalo_container', 5.0)
+# coletar mais rapido que o scrape do Prometheus nao cria dado novo, so
+# encurta a espera entre o scrape chegar e a tela mostrar
+INTERVALO_CONTAINER = CONFIG.get('intervalo_container', 3.0)
 HISTORICO = CONFIG.get('historico', 60)
 
 # prefixo que identifica um container de tenant, pro veredito saber o que
@@ -323,13 +325,17 @@ class Unidade:
 
     def coletar_containers(self):
         i = self.prom
+        # irate com janela de 1min, nao rate de 2min: o Prometheus raspa o
+        # cAdvisor a cada 15s, entao rate[2m] era media de 8 amostras e um
+        # pico levava dois minutos para aparecer e sumir. irate usa as duas
+        # amostras mais recentes, entao o numero muda a cada scrape
         # so containers vistos agora. Quando uma task e recriada, a serie da
         # antiga fica no Prometheus por mais 5 min: sem este filtro o tenant
         # aparecia duas vezes e o consumo podia sair da task morta, com 0%
         vivo = ('and on (name) (max by (name) (time() - container_last_seen'
                 '{instance="%s",name!=""}) < %d)' % (i, FRESCURA_CONTAINER))
-        cpu = prom_query('sum by (name) (rate(container_cpu_usage_seconds_total'
-                         '{instance="%s",name!=""}[2m])) * 100 %s' % (i, vivo))
+        cpu = prom_query('sum by (name) (irate(container_cpu_usage_seconds_total'
+                         '{instance="%s",name!=""}[1m])) * 100 %s' % (i, vivo))
         # uso real, sem o cache reclaimavel do kernel (dentry/inode slab, que
         # o kernel devolve sob pressao e inflava os apps). rss + page cache e
         # o que a aplicacao de fato ocupa; buscados separados pra um container
@@ -338,10 +344,10 @@ class Unidade:
                              '{instance="%s",name!=""}) %s' % (i, vivo))
         mem_cache = prom_query('sum by (name) (container_memory_cache'
                                '{instance="%s",name!=""}) %s' % (i, vivo))
-        rx = prom_query('sum by (name) (rate(container_network_receive_bytes_total'
-                        '{instance="%s",name!=""}[2m])) %s' % (i, vivo))
-        tx = prom_query('sum by (name) (rate(container_network_transmit_bytes_total'
-                        '{instance="%s",name!=""}[2m])) %s' % (i, vivo))
+        rx = prom_query('sum by (name) (irate(container_network_receive_bytes_total'
+                        '{instance="%s",name!=""}[1m])) %s' % (i, vivo))
+        tx = prom_query('sum by (name) (irate(container_network_transmit_bytes_total'
+                        '{instance="%s",name!=""}[1m])) %s' % (i, vivo))
 
         def mapa(res):
             return {s['metric'].get('name', '?'): float(s['value'][1])
@@ -599,24 +605,24 @@ def cor_por_valor(pct):
 # por que esta versao parece a referencia e as anteriores nao:
 #
 # Braille (U+2800) carrega 2x4 subpixels por celula, contra 1x2 do
-# meio-bloco e 2x2 do quadrante. E a celula certa pra line-art — a mesma
+# meio-bloco e 2x2 do quadrante. E a celula certa pra line-art - a mesma
 # que drawille e plotext usam pra grafico de linha. Com meio-bloco o traco
 # fino nao cabe e o desenho vira degrau.
 #
 # E o que vai na tela e o CONTORNO, nao o preenchimento. A tentativa
 # anterior enchia as faixas pra elas sobreviverem a reducao, e a marca
-# virava um bloco solido — o oposto da referencia, que e traco fino.
+# virava um bloco solido - o oposto da referencia, que e traco fino.
 #
 # Os arcos concentricos entram como camada de tras, em verde apagado: sao
 # boa parte da atmosfera do original. Celula vazia da marca e espaco comum,
 # entao o arco aparece por baixo.
 #
-# Na arte os arcos cobrem so a metade de cima — e uma cupula, nao um
+# Na arte os arcos cobrem so a metade de cima - e uma cupula, nao um
 # circulo. O gerador mede o centro e os raios dos aneis existentes e fecha
 # as circunferencias nesses mesmos raios, entao o traco irregular do
 # original fica onde ele existe e o resto do circulo vem desenhado.
 #
-# Pra regerar a partir da arte, veja ferramentas/gerar_logo.py — o Pillow
+# Pra regerar a partir da arte, veja ferramentas/gerar_logo.py - o Pillow
 # fica la, aqui o desenho ja vem pronto.
 
 LOGO_GRANDE = (   # 52 colunas x 26 linhas
@@ -783,7 +789,7 @@ def emblema():
 # O diagrama da aba DIAGRAMA, no estilo da tela do MAGI: tres blocos
 # preenchidos com o nome vazado em preto, cantos chanfrados apontando pro
 # centro, e MAGI no meio. A cor do bloco e o estado da unidade, entao a tela
-# inteira muda de cor junto — que e o efeito do "ALL GREEN" do original.
+# inteira muda de cor junto - que e o efeito do "ALL GREEN" do original.
 #
 # O chanfro usa bloco de tres quadrantes e nao triangulo geometrico: o
 # triangulo nao preenche a celula na maioria das fontes e a diagonal sai
@@ -903,8 +909,8 @@ def _desenha_tela(tela):
 
 def _ficha_unidade(u):
     """As tres linhas que vao dentro do bloco: quem e, o que esta pegando,
-    e o que carrega. A segunda linha e o gargalo — o recurso mais apertado
-    e o quanto ele esta — pra tela dizer o que esta causando o problema, e
+    e o que carrega. A segunda linha e o gargalo - o recurso mais apertado
+    e o quanto ele esta - pra tela dizer o que esta causando o problema, e
     nao so que ha um."""
     if not u.online:
         return [u.rotulo, 'SEM RESPOSTA', u.ip]
@@ -966,7 +972,7 @@ def faisca(valores, largura=28, cor=AMBAR, teto=None):
 
     Duas correcoes em cima disso: (1) com teto fixo e utilizacao baixa (CPU a
     1%, por exemplo), o arredondamento linear jogava tudo pro nivel 0, que e
-    espaco em branco — o grafico sumia. Por isso usa raiz quadrada quando ha
+    espaco em branco - o grafico sumia. Por isso usa raiz quadrada quando ha
     teto absoluto: comprime a escala pra utilizacao baixa ainda aparecer, sem
     fingir que esta alta. (2) sem teto, uma folga de 30% sobre o pico evita
     que a linha fique sempre "no talo" (virando uma barra solida comprida).
@@ -1130,7 +1136,7 @@ def pegada_tenant(unidades):
 
 def cabem_tenants(u, pegada):
     """Quantos tenants ainda cabem na unidade pela memoria, respeitando o
-    teto de seguranca. So considera memoria — disco e CPU entram no
+    teto de seguranca. So considera memoria - disco e CPU entram no
     veredito pela via do gargalo()."""
     if not pegada or not u.mem_total:
         return None
@@ -1781,7 +1787,7 @@ def ajustar_janela(console):
     Manda a sequencia CSI 8 (a mesma que o `resize` do xterm usa). E uma
     melhoria oportunista, nao uma garantia: varios emuladores ignoram esse
     pedido por seguranca, e dentro de tmux ou screen ela teria que ser
-    reempacotada pra chegar no terminal de verdade — por isso esses casos
+    reempacotada pra chegar no terminal de verdade - por isso esses casos
     saem fora antes de escrever qualquer coisa, pra nao vazar lixo na tela.
 
     So aumenta, nunca encolhe: diminuir a janela de alguem que ja deixou

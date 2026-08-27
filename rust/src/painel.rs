@@ -113,7 +113,7 @@ impl Cortes {
 ///
 /// O chanfro anda uma coluna por linha: com duas, o degrau fica com duas
 /// colunas e o bisel ocupa so a primeira, entao o corte parece grosseiro.
-/// Linha com corte zero e linha cheia — pintar o bisel ali deixava uma lasca
+/// Linha com corte zero e linha cheia - pintar o bisel ali deixava uma lasca
 /// solta na borda, que era o que fazia o bloco parecer serrilhado.
 #[allow(clippy::too_many_arguments)]
 fn bloco(

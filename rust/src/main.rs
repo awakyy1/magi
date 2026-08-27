@@ -187,7 +187,7 @@ fn agora_hhmmss() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     // horario local sem dependencia externa: o deslocamento vem do proprio
-    // sistema, via `date`, uma vez por processo nao vale a pena — entao usa
+    // sistema, via `date`, uma vez por processo nao vale a pena - entao usa
     // UTC deslocado pelo offset lido na abertura
     let secs = d.as_secs() as i64 + *DESLOC;
     let dia = secs % 86400;

@@ -10,6 +10,13 @@
   "//": "unidades sem cAdvisor: dizem o motivo em vez de tabela vazia",
   "sem_cadvisor": [],
 
+  "//faixa": "faixa de disponibilidade da aba CLUSTER: janela em minutos e numero de blocos. 30 e 30 da um bloco por minuto",
+  "janela_sonda": 30,
+  "blocos_sonda": 30,
+
+  "//frescura": "segundos desde o ultimo scrape para um container ainda contar como vivo. Task recriada deixa a serie da antiga no Prometheus por 5 min",
+  "frescura_container": 90,
+
   "//cluster": "bloco opcional. Sem ele a aba CLUSTER nao aparece. Os nomes de job e de label sao os do seu Prometheus; servico_app e servico_banco sao os nomes dos servicos do Swarm dentro de cada stack de tenant",
   "cluster": {
     "job_banco": "mysql",

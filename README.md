@@ -26,7 +26,7 @@ Five tabs, all driven by live data, plus a sixth when you configure it:
 | `GERAL` | all nodes side by side, plus the verdict (see below) |
 | one per node | host detail and the container table, sorted by CPU |
 | `DIAGRAMA` | the MAGI status screen, with each node's bottleneck |
-| `CLUSTER` | one row per tenant: which node runs it, HTTP probe, app and database usage, replica state and lag (see below) |
+| `CLUSTER` | one row per tenant: which node runs it, HTTP probe, app and database usage, CPU, replica state and lag, and an availability strip (see below) |
 
 ### The tenant view
 
@@ -57,8 +57,29 @@ columns simply stay empty. To place tenants on nodes, give each node a `caixa`
 `sigla`. From 156 columns wide the tab splits per node side by side, which is
 the view that shows imbalance.
 
-The CPU bar uses one scale across all nodes on purpose. A per-table scale
-makes every node look equally busy.
+### The availability strip
+
+The rightmost column is a status history, one block per slice of time, newest
+on the right: green means the probe answered, red means it did not, dim means
+there is no data yet. It comes from one `query_range` over `probe_success` for
+every tenant at once, so the cost does not grow with the number of tenants.
+
+This is the one thing a table of current values cannot show. A tenant that
+flapped twice in the last half hour reads as `UP` in every other column; here
+it reads as two red blocks. Window and block count come from `janela_sonda`
+and `blocos_sonda` (30 and 30 by default, so one block per minute).
+
+Blocks are solid in both states on purpose. A failure has to weigh as much on
+the eye as a success, otherwise you scan past it.
+
+### Dead tasks
+
+When Swarm recreates a task, cAdvisor's series for the old one lingers in
+Prometheus for about five minutes. Left alone, the tenant shows up twice and
+its usage may be read off the dead task, which reports 0% CPU. Every container
+query is filtered by a recent `container_last_seen`; `frescura_container` sets
+how recent (90 seconds by default). This applies to the per-node container
+table too.
 
 ### Swarm task names
 
@@ -226,7 +247,8 @@ disables the window resize request.
   seeding the history graphs. Without it the tool still works; the container
   tab is just empty and the graphs start from zero.
 - For the `CLUSTER` tab, a Prometheus with a database exporter per tenant and,
-  if you want the site column, a blackbox probe per tenant. List nodes that do
+  if you want the site column and the availability strip, a blackbox probe per
+  tenant. List nodes that do
   not run cAdvisor under `sem_cadvisor` and they say so instead of showing an
   empty table.
 

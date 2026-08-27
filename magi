@@ -1754,6 +1754,17 @@ def laco_containers(unidades, cluster, parar):
         parar.wait(INTERVALO_CONTAINER)
 
 
+def atualizar_agora(unidades, cluster):
+    """Forca uma coleta fora da thread da interface, para a tecla r nao travar."""
+    threads = [threading.Thread(target=_tenta, args=(u.coletar_containers,),
+                                daemon=True) for u in unidades]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=8.0)
+    _tenta(cluster.coletar)
+
+
 def ler_tecla():
     if select.select([sys.stdin], [], [], 0)[0]:
         c = sys.stdin.read(1)
@@ -1872,10 +1883,31 @@ def main():
             Layout(name='corpo'),
             Layout(name='base', size=1),
         )
+        def pintar(vivo, aba, agora):
+            layout['topo'].update(cabecalho(aba, unidades))
+            if aba == 0:
+                layout['corpo'].update(aba_geral(unidades))
+            elif TEM_CLUSTER and aba == total_abas - 1:
+                layout['corpo'].update(aba_cluster(cluster, unidades))
+            elif aba == 1 + len(unidades):
+                layout['corpo'].update(aba_diagrama(unidades, cluster))
+            else:
+                layout['corpo'].update(aba_unidade(unidades[aba - 1]))
+            layout['base'].update(rodape())
+            if vivo is not None:
+                vivo.refresh()
+            return agora
+
+        # o laco le teclado a cada 30ms mas so remonta a tela a cada 250ms:
+        # montar custa pouco, desenhar custa uns 30ms, e antes o sleep(0.1)
+        # fazia a tecla levar ate 350ms para aparecer. Tecla pressionada
+        # redesenha na hora, entao a troca de aba responde no ato
         with Live(layout, console=console, screen=True, refresh_per_second=4,
-                  transient=False):
+                  transient=False) as vivo:
+            ultimo = 0.0
             while True:
                 tecla = ler_tecla()
+                agora = time.time()
                 if tecla:
                     if tecla in ('q', 'Q', '\x03'):
                         break
@@ -1888,22 +1920,15 @@ def main():
                     elif tecla == 'esquerda':
                         aba = (aba - 1) % total_abas
                     elif tecla in ('r', 'R'):
-                        for u in unidades:
-                            _tenta(u.coletar_containers)
-                        _tenta(cluster.coletar)
-
-                layout['topo'].update(cabecalho(aba, unidades))
-                if aba == 0:
-                    layout['corpo'].update(aba_geral(unidades))
-                elif TEM_CLUSTER and aba == total_abas - 1:
-                    layout['corpo'].update(aba_cluster(cluster, unidades))
-                elif aba == 1 + len(unidades):
-                    layout['corpo'].update(aba_diagrama(unidades, cluster))
-                else:
-                    layout['corpo'].update(
-                        aba_unidade(unidades[aba - 1]))
-                layout['base'].update(rodape())
-                time.sleep(0.1)
+                        # em thread: sao varias consultas em serie, e na
+                        # thread da interface isso congelava a tela
+                        threading.Thread(target=atualizar_agora,
+                                         args=(unidades, cluster),
+                                         daemon=True).start()
+                    ultimo = pintar(vivo, aba, agora)
+                elif agora - ultimo >= 0.25:
+                    ultimo = pintar(None, aba, agora)
+                time.sleep(0.03)
     finally:
         parar.set()
         termios.tcsetattr(fd, termios.TCSADRAIN, antigo)

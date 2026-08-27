@@ -344,8 +344,12 @@ fn rodar_ui(unidades: &Unidades, estado_cluster: &Arc<Mutex<Cluster>>) -> io::Re
     let mut aba = 0usize;
     let mut ultimo = Instant::now();
 
+    // 30ms no poll e desenho a cada 250ms: desenhar custa uns 30ms, e com
+    // poll de 100ms a tecla demorava a aparecer. Tecla pressionada desenha na
+    // hora, entao a troca de aba responde no ato
     let saida = loop {
-        if event::poll(Duration::from_millis(100))? {
+        let mut agora_tecla = false;
+        if event::poll(Duration::from_millis(30))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
                     match k.code {
@@ -381,11 +385,12 @@ fn rodar_ui(unidades: &Unidades, estado_cluster: &Arc<Mutex<Cluster>>) -> io::Re
                         }
                         _ => {}
                     }
+                    agora_tecla = true;
                 }
             }
         }
 
-        if ultimo.elapsed() >= Duration::from_millis(250) {
+        if agora_tecla || ultimo.elapsed() >= Duration::from_millis(250) {
             ultimo = Instant::now();
             let hora = agora_hhmmss();
             term.draw(|f| {

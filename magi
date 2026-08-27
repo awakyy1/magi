@@ -1374,10 +1374,12 @@ def faixa_sonda(valores, largura=BLOCOS_SONDA):
     if faltam > 0:
         t.append('░' * faltam, style=FOSCO)
     for v in valores[-largura:]:
-        # meio-bloco, nao bloco cheio: deixa uma folga a direita de cada
-        # celula, entao a faixa se le como blocos de tempo separados em vez
-        # de virar uma barra continua
-        t.append('▌', style=VERDE if v >= 1 else VERMELHO)
+        # quadrante de baixo a esquerda: deixa folga a direita E acima de
+        # cada celula. Com meio-bloco a faixa se separava na horizontal, mas
+        # 18 linhas de verde colavam na vertical e o conjunto virava um
+        # retangulo. Regua entre as linhas resolveria tambem, mas dobraria a
+        # altura da tabela, que nao cabe na janela
+        t.append('▖', style=VERDE if v >= 1 else VERMELHO)
     return t
 
 
@@ -1531,9 +1533,9 @@ def aba_cluster(cluster, unidades):
                            'TENANTS')
     legenda = Text()
     legenda.append('faixa  ', style=FOSCO)
-    legenda.append('▌', style=VERDE)
+    legenda.append('▖', style=VERDE)
     legenda.append(' respondendo   ', style=FOSCO)
-    legenda.append('▌', style=VERMELHO)
+    legenda.append('▖', style=VERMELHO)
     legenda.append(' sem responder   ', style=FOSCO)
     legenda.append('░', style=FOSCO)
     legenda.append(' sem dado   1 bloco = %d min, o mais recente a direita'

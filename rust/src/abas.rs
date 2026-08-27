@@ -626,11 +626,13 @@ fn faixa_sonda<'a>(valores: &[f64], largura: usize) -> Vec<Span<'a>> {
     }
     let ini = valores.len().saturating_sub(largura);
     for v in &valores[ini..] {
-        // meio-bloco, nao bloco cheio: deixa uma folga a direita de cada
-        // celula, entao a faixa se le como blocos de tempo separados em vez
-        // de virar uma barra continua
+        // quadrante de baixo a esquerda: deixa folga a direita E acima de
+        // cada celula. Com meio-bloco a faixa se separava na horizontal, mas
+        // as linhas de verde colavam na vertical e o conjunto virava um
+        // retangulo. Regua entre as linhas resolveria tambem, mas dobraria a
+        // altura da tabela, que nao cabe na janela
         spans.push(Span::styled(
-            "▌",
+            "▖",
             Style::new().fg(if *v >= 1.0 { VERDE } else { VERMELHO }),
         ));
     }
@@ -889,9 +891,9 @@ pub fn aba_cluster(
     tab.push(Line::from(""));
     tab.push(Line::from(vec![
         fosco("faixa  "),
-        Span::styled("▌", Style::new().fg(VERDE)),
+        Span::styled("▖", Style::new().fg(VERDE)),
         fosco(" respondendo   "),
-        Span::styled("▌", Style::new().fg(VERMELHO)),
+        Span::styled("▖", Style::new().fg(VERMELHO)),
         fosco(" sem responder   "),
         fosco("░"),
         fosco(format!(

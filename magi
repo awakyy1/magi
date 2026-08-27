@@ -82,6 +82,14 @@ SEM_CADVISOR = tuple(CONFIG.get('sem_cadvisor', []))
 CLUSTER = CONFIG.get('cluster') or {}
 TEM_CLUSTER = bool(CLUSTER.get('job_banco'))
 
+# faixa de disponibilidade da aba CLUSTER. Largura fixa porque a faixa e uma
+# janela de tempo, nao uma proporcao: esticar mudaria o que cada bloco vale
+JANELA_SONDA = CONFIG.get('janela_sonda', 30)
+BLOCOS_SONDA = CONFIG.get('blocos_sonda', 30)
+
+# segundos desde o ultimo scrape para o container ainda contar como vivo
+FRESCURA_CONTAINER = CONFIG.get('frescura_container', 90)
+
 COLETORES = ('cpu', 'meminfo', 'filesystem', 'netdev', 'diskstats',
              'loadavg', 'time', 'stat')
 
@@ -315,20 +323,25 @@ class Unidade:
 
     def coletar_containers(self):
         i = self.prom
+        # so containers vistos agora. Quando uma task e recriada, a serie da
+        # antiga fica no Prometheus por mais 5 min: sem este filtro o tenant
+        # aparecia duas vezes e o consumo podia sair da task morta, com 0%
+        vivo = ('and on (name) (max by (name) (time() - container_last_seen'
+                '{instance="%s",name!=""}) < %d)' % (i, FRESCURA_CONTAINER))
         cpu = prom_query('sum by (name) (rate(container_cpu_usage_seconds_total'
-                         '{instance="%s",name!=""}[2m])) * 100' % i)
+                         '{instance="%s",name!=""}[2m])) * 100 %s' % (i, vivo))
         # uso real, sem o cache reclaimavel do kernel (dentry/inode slab, que
         # o kernel devolve sob pressao e inflava os apps). rss + page cache e
         # o que a aplicacao de fato ocupa; buscados separados pra um container
         # nao sumir se uma metrica faltar
         mem_rss = prom_query('sum by (name) (container_memory_rss'
-                             '{instance="%s",name!=""})' % i)
+                             '{instance="%s",name!=""}) %s' % (i, vivo))
         mem_cache = prom_query('sum by (name) (container_memory_cache'
-                               '{instance="%s",name!=""})' % i)
+                               '{instance="%s",name!=""}) %s' % (i, vivo))
         rx = prom_query('sum by (name) (rate(container_network_receive_bytes_total'
-                        '{instance="%s",name!=""}[2m]))' % i)
+                        '{instance="%s",name!=""}[2m])) %s' % (i, vivo))
         tx = prom_query('sum by (name) (rate(container_network_transmit_bytes_total'
-                        '{instance="%s",name!=""}[2m]))' % i)
+                        '{instance="%s",name!=""}[2m])) %s' % (i, vivo))
 
         def mapa(res):
             return {s['metric'].get('name', '?'): float(s['value'][1])
@@ -474,10 +487,12 @@ class Cluster:
             rep_lag = prom_query('mysql_slave_status_seconds_behind_master'
                                  '{job="%s"}' % self.job_replica)
         sonda = atraso = []
+        hist = {}
         if self.job_sonda:
             sonda = prom_query('probe_success{job="%s"}' % self.job_sonda)
             atraso = prom_query('probe_duration_seconds{job="%s"}'
                                 % self.job_sonda)
+            hist = self.historico_sonda()
 
         def vals(res, chave):
             return {x['metric'].get(chave, '?'): float(x['value'][1])
@@ -521,6 +536,7 @@ class Cluster:
                 'app_cpu': g.get('cpu'), 'app_mem': g.get('mem'),
                 'db_cpu': d.get('cpu'), 'db_mem': d.get('mem'),
                 'tem_task': bool(g),
+                'hist': hist.get(tenant, []),
                 'rep': (tem_rep,
                         v_io.get(tenant, 0.0) >= 1 and v_sql.get(tenant, 0.0) >= 1,
                         v_lag.get(tenant)),
@@ -529,6 +545,31 @@ class Cluster:
             self.tenants = linhas
             self.erro = ''
             self.atualizado = time.time()
+
+    def historico_sonda(self):
+        """Faixa de disponibilidade por tenant, um valor por bloco da barra.
+
+        Uma consulta de intervalo para todos os tenants de uma vez, em vez de
+        uma por tenant. O passo e a janela dividida pelo numero de blocos,
+        entao cada bloco vale JANELA_SONDA / BLOCOS_SONDA de tempo real e a
+        faixa anda para a direita conforme o tempo passa.
+        """
+        passo = max(15, JANELA_SONDA * 60 // BLOCOS_SONDA)
+        res = prom_range('probe_success{job="%s"}' % self.job_sonda,
+                         minutos=JANELA_SONDA, passo=passo)
+        saida = {}
+        for serie in res:
+            tenant = serie['metric'].get('instance', '')
+            if not tenant:
+                continue
+            valores = []
+            for _, v in serie.get('values', [])[-BLOCOS_SONDA:]:
+                try:
+                    valores.append(float(v))
+                except (TypeError, ValueError):
+                    pass
+            saida[tenant] = valores
+        return saida
 
     def resumo(self):
         with self.lock:
@@ -1321,18 +1362,31 @@ def _cel_bytes(v):
         Text(bytes_h(v), style=AMBAR)
 
 
-def pico_cpu(linhas):
-    """Escala comum das barras: sem isso os nos ficam incomparaveis."""
-    return max(((x['app_cpu'] or 0) + (x['db_cpu'] or 0) for x in linhas),
-               default=0) or 1.0
+def faixa_sonda(valores, largura=BLOCOS_SONDA):
+    """Historico de disponibilidade em blocos, o mais recente a direita.
+
+    Verde respondendo, vermelho sem responder, apagado sem dado. Bloco cheio
+    nos dois estados de proposito: uma falha tem de pesar tanto na vista
+    quanto o sucesso, senao o olho passa batido.
+    """
+    t = Text()
+    faltam = largura - len(valores)
+    if faltam > 0:
+        t.append('░' * faltam, style=FOSCO)
+    for v in valores[-largura:]:
+        t.append('█', style=VERDE if v >= 1 else VERMELHO)
+    return t
 
 
-def tabela_tenants(linhas, titulo, larg_barra=10):
+def tabela_tenants(linhas, titulo):
     # rotulo curto e fixo: cortar o nome do servico em 5 letras produzia
     # cabecalho feio ('mariadb' virava 'MARIA'). O nome completo do servico
     # aparece na aba da unidade, no nome da task
     rot_app, rot_db = 'APP', 'DB'
-    tab = Table(expand=True, border_style=FOSCO, box=None,
+    # expand=False e tabela centralizada: a faixa tem largura fixa, porque e
+    # janela de tempo e nao proporcao, entao nao existe coluna elastica para
+    # absorver a sobra da largura
+    tab = Table(expand=False, border_style=FOSCO, box=None,
                 header_style='bold %s' % LARANJA, title=titulo,
                 title_style='bold %s' % AMBAR, pad_edge=False, padding=(0, 1))
     tab.add_column('TENANT', style=AMBAR, no_wrap=True, width=13)
@@ -1343,16 +1397,14 @@ def tabela_tenants(linhas, titulo, larg_barra=10):
     tab.add_column('MEM', justify='right', width=7)
     tab.add_column(rot_db, justify='right', width=5)
     tab.add_column('MEM', justify='right', width=7)
+    tab.add_column('CPU', justify='right', width=5)
     tab.add_column('REPL', justify='left', width=8)
-    # ultima coluna elastica de proposito: absorve a sobra de largura em vez
-    # de deixar um vao entre TENANT e o resto
-    tab.add_column('CPU', justify='left', ratio=1, min_width=8)
+    tab.add_column('DISPONIBILIDADE %dmin' % JANELA_SONDA, justify='left',
+                   width=max(BLOCOS_SONDA, 19))
 
     if not linhas:
-        tab.add_row(Text('sem dados', style=FOSCO), *[''] * 9)
+        tab.add_row(Text('sem dados', style=FOSCO), *[''] * 10)
         return tab
-
-    pico = pico_cpu(linhas)
 
     for x in linhas:
         cor = estado_tenant(x)
@@ -1376,7 +1428,8 @@ def tabela_tenants(linhas, titulo, larg_barra=10):
                        LARANJA_FORTE if lag < 300 else VERMELHO)
             repl = Text('%s %ds' % (x['no_rep'], int(lag)), style=cor_lag)
 
-        soma_cpu = (x['app_cpu'] or 0) + (x['db_cpu'] or 0)
+        tem_cpu = x['app_cpu'] is not None or x['db_cpu'] is not None
+        soma = (x['app_cpu'] or 0) + (x['db_cpu'] or 0)
         tab.add_row(
             Text('%s %s' % ('●' if cor == VERDE else '○', x['tenant'][:11]),
                  style=cor),
@@ -1384,8 +1437,9 @@ def tabela_tenants(linhas, titulo, larg_barra=10):
             site, ms,
             _cel_pct(x['app_cpu']), _cel_bytes(x['app_mem']),
             _cel_pct(x['db_cpu']), _cel_bytes(x['db_mem']),
+            _cel_pct(soma if tem_cpu else None),
             repl,
-            barra(soma_cpu / pico * 100, larg_barra),
+            faixa_sonda(x.get('hist', [])),
         )
     return tab
 
@@ -1470,10 +1524,19 @@ def aba_cluster(cluster, unidades):
     #
     # A barra leva toda a sobra da largura: com teto fixo sobrava um vao morto
     # a direita da tabela em terminal largo.
-    corpo = tabela_tenants(
-        sorted(linhas, key=lambda x: (x['no'], x['tenant'])), 'TENANTS',
-        max(8, largura_terminal() - 84))
-    return Group(topo, Text(''), corpo)
+    corpo = tabela_tenants(sorted(linhas, key=lambda x: (x['no'], x['tenant'])),
+                           'TENANTS')
+    legenda = Text()
+    legenda.append('faixa  ', style=FOSCO)
+    legenda.append('█', style=VERDE)
+    legenda.append(' respondendo   ', style=FOSCO)
+    legenda.append('█', style=VERMELHO)
+    legenda.append(' sem responder   ', style=FOSCO)
+    legenda.append('░', style=FOSCO)
+    legenda.append(' sem dado   1 bloco = %d min, o mais recente a direita'
+                   % max(1, JANELA_SONDA // BLOCOS_SONDA), style=FOSCO)
+    return Group(topo, Text(''), Align.center(corpo), Text(''),
+                 Align.center(legenda))
 
 
 def aba_diagrama(unidades):

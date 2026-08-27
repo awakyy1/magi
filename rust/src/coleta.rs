@@ -317,22 +317,31 @@ impl Unidade {
     /// A parte de rede dos containers, tambem fora do mutex.
     pub fn buscar_containers(prom: &str) -> Vec<Container> {
         let i = prom;
-        let cpu = prom_query(&format!(
+        // so containers vistos agora. Quando uma task e recriada, a serie da
+        // antiga fica no Prometheus por mais 5 min: sem este filtro o tenant
+        // aparecia duas vezes e o consumo podia sair da task morta, com 0%
+        // o espaco no inicio importa: isto e concatenado no fim da expressao
+        let vivo = format!(
+            " and on (name) (max by (name) (time() - container_last_seen\
+             {{instance=\"{}\",name!=\"\"}}) < {})",
+            i, FRESCURA_CONTAINER
+        );
+        let cpu = prom_query(&(format!(
             "sum by (name) (rate(container_cpu_usage_seconds_total{{instance=\"{}\",name!=\"\"}}[2m])) * 100",
             i
-        ));
-        let mem = prom_query(&format!(
+        ) + &vivo));
+        let mem = prom_query(&(format!(
             "sum by (name) (container_memory_usage_bytes{{instance=\"{}\",name!=\"\"}})",
             i
-        ));
-        let rx = prom_query(&format!(
+        ) + &vivo));
+        let rx = prom_query(&(format!(
             "sum by (name) (rate(container_network_receive_bytes_total{{instance=\"{}\",name!=\"\"}}[2m]))",
             i
-        ));
-        let tx = prom_query(&format!(
+        ) + &vivo));
+        let tx = prom_query(&(format!(
             "sum by (name) (rate(container_network_transmit_bytes_total{{instance=\"{}\",name!=\"\"}}[2m]))",
             i
-        ));
+        ) + &vivo));
 
         let mut nomes: Vec<String> = cpu.keys().chain(mem.keys()).cloned().collect();
         nomes.sort();
@@ -595,6 +604,55 @@ impl Serie {
     pub fn rotulo(&self, chave: &str) -> &str {
         self.rotulos.get(chave).map(|s| s.as_str()).unwrap_or("")
     }
+}
+
+/// Segundos desde o ultimo scrape para o container ainda contar como vivo.
+pub const FRESCURA_CONTAINER: u64 = 90;
+
+/// Serie de intervalo com os rotulos: o `prom_range` devolve so a primeira
+/// serie, e a faixa de disponibilidade precisa de uma por tenant.
+pub fn prom_range_series(expr: &str, minutos: i64, passo: i64) -> Vec<(HashMap<String, String>, Vec<f64>)> {
+    let fim = agora_epoch() as i64;
+    let ini = fim - minutos * 60;
+    let url = format!(
+        "{}/api/v1/query_range?query={}&start={}&end={}&step={}",
+        cfg::get().prometheus.clone(),
+        url_encode(expr),
+        ini,
+        fim,
+        passo
+    );
+    let mut saida = Vec::new();
+    let corpo = match http_get(&url, Duration::from_secs(10)) {
+        Ok(c) => c,
+        Err(_) => return saida,
+    };
+    let json: serde_json::Value = match serde_json::from_str(&corpo) {
+        Ok(v) => v,
+        Err(_) => return saida,
+    };
+    if let Some(res) = json["data"]["result"].as_array() {
+        for s in res {
+            let mut rotulos = HashMap::new();
+            if let Some(m) = s["metric"].as_object() {
+                for (k, v) in m {
+                    if let Some(t) = v.as_str() {
+                        rotulos.insert(k.clone(), t.to_string());
+                    }
+                }
+            }
+            let vals: Vec<f64> = s["values"]
+                .as_array()
+                .map(|vs| {
+                    vs.iter()
+                        .filter_map(|pt| pt[1].as_str().and_then(|x| x.parse::<f64>().ok()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            saida.push((rotulos, vals));
+        }
+    }
+    saida
 }
 
 pub fn prom_series(expr: &str) -> Vec<Serie> {

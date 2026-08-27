@@ -29,6 +29,8 @@ pub struct Linha {
     pub db_cpu: Option<f64>,
     pub db_mem: Option<f64>,
     pub tem_task: bool,
+    /// Disponibilidade recente, um valor por bloco da faixa, mais novo no fim.
+    pub hist: Vec<f64>,
     pub rep_existe: bool,
     pub rep_ok: bool,
     pub rep_lag: Option<f64>,
@@ -98,13 +100,29 @@ impl Cluster {
         }
     }
 
-    pub fn escala_cpu(&self) -> f64 {
-        self.tenants
-            .iter()
-            .map(|x| x.cpu_total())
-            .fold(0.0_f64, f64::max)
-            .max(1.0)
+}
+
+/// Faixa de disponibilidade por tenant: uma consulta de intervalo para todos,
+/// em vez de uma por tenant. Cada bloco vale janela/blocos de tempo real, e a
+/// faixa anda para a direita conforme o tempo passa.
+fn historico_sonda(job: &str) -> HashMap<String, Vec<f64>> {
+    let janela = cfg::get().janela_sonda;
+    let blocos = cfg::get().blocos_sonda;
+    let passo = (janela * 60 / blocos.max(1) as i64).max(15);
+    let mut saida = HashMap::new();
+    for (rotulos, valores) in coleta::prom_range_series(
+        &format!("probe_success{{job=\"{}\"}}", job),
+        janela,
+        passo,
+    ) {
+        let tenant = rotulos.get("instance").cloned().unwrap_or_default();
+        if tenant.is_empty() {
+            continue;
+        }
+        let ini = valores.len().saturating_sub(blocos);
+        saida.insert(tenant, valores[ini..].to_vec());
     }
+    saida
 }
 
 fn sigla_da_caixa(caixa: &str) -> String {
@@ -152,12 +170,14 @@ pub fn buscar(unidades: &[Arc<Mutex<Unidade>>]) -> Result<Vec<Linha>, String> {
         ));
     }
     let (mut sonda, mut atraso) = (Vec::new(), Vec::new());
+    let mut hist: HashMap<String, Vec<f64>> = HashMap::new();
     if !c.job_sonda.is_empty() {
         sonda = coleta::prom_series(&format!("probe_success{{job=\"{}\"}}", c.job_sonda));
         atraso = coleta::prom_series(&format!(
             "probe_duration_seconds{{job=\"{}\"}}",
             c.job_sonda
         ));
+        hist = historico_sonda(&c.job_sonda);
     }
 
     let por = |s: &[coleta::Serie], chave: &str| -> HashMap<String, f64> {
@@ -231,6 +251,7 @@ pub fn buscar(unidades: &[Arc<Mutex<Unidade>>]) -> Result<Vec<Linha>, String> {
             db_cpu: db.map(|x| x.0),
             db_mem: db.map(|x| x.1),
             tem_task: app.is_some(),
+            hist: hist.get(&tenant).cloned().unwrap_or_default(),
             rep_existe: tem_rep,
             rep_ok: v_io.get(&tenant).copied().unwrap_or(0.0) >= 1.0
                 && v_sql.get(&tenant).copied().unwrap_or(0.0) >= 1.0,

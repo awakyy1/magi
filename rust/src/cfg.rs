@@ -75,6 +75,10 @@ pub struct Config {
     pub altura_ideal: u16,
     /// Nos que nao rodam cAdvisor: dizem o motivo em vez de tabela vazia.
     pub sem_cadvisor: Vec<String>,
+    /// Janela da faixa de disponibilidade, em minutos, e quantos blocos ela
+    /// tem. Largura fixa porque a faixa e janela de tempo, nao proporcao.
+    pub janela_sonda: i64,
+    pub blocos_sonda: usize,
     pub cluster: Option<ClusterCfg>,
     pub nos: Vec<No>,
 }
@@ -175,6 +179,8 @@ pub fn carregar() -> Result<(), String> {
         largura_ideal: num("largura_ideal", 106) as u16,
         altura_ideal: num("altura_ideal", 40) as u16,
         sem_cadvisor,
+        janela_sonda: num("janela_sonda", 30) as i64,
+        blocos_sonda: num("blocos_sonda", 30) as usize,
         cluster,
         nos,
     };

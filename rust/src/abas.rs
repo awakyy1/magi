@@ -613,6 +613,37 @@ fn estado_tenant(x: &Linha) -> ratatui::style::Color {
     VERDE
 }
 
+/// Historico de disponibilidade em blocos, o mais recente a direita.
+///
+/// Verde respondendo, vermelho sem responder, apagado sem dado. Bloco cheio
+/// nos dois estados de proposito: uma falha tem de pesar tanto na vista quanto
+/// o sucesso, senao o olho passa batido.
+fn faixa_sonda<'a>(valores: &[f64], largura: usize) -> Vec<Span<'a>> {
+    let mut spans = Vec::new();
+    let faltam = largura.saturating_sub(valores.len());
+    if faltam > 0 {
+        spans.push(Span::styled("░".repeat(faltam), Style::new().fg(FOSCO)));
+    }
+    let ini = valores.len().saturating_sub(largura);
+    for v in &valores[ini..] {
+        spans.push(Span::styled(
+            "█",
+            Style::new().fg(if *v >= 1.0 { VERDE } else { VERMELHO }),
+        ));
+    }
+    spans
+}
+
+/// Larguras das colunas da tabela de tenants. Uma funcao so, porque a aba
+/// precisa da largura natural para centralizar a tabela.
+fn larguras_tenants(blocos: usize) -> Vec<usize> {
+    vec![13, 3, 4, 4, 5, 7, 5, 7, 5, 8, blocos.max(19)]
+}
+
+fn largura_natural(larguras: &[usize]) -> usize {
+    larguras.iter().map(|l| l + 2).sum::<usize>() + larguras.len() + 1
+}
+
 fn cel_pct<'a>(v: Option<f64>) -> Cel<'a> {
     match v {
         None => Cel::txt("-", Style::new().fg(FOSCO), true),
@@ -627,13 +658,7 @@ fn cel_bytes<'a>(v: Option<f64>) -> Cel<'a> {
     }
 }
 
-fn tabela_tenants<'a>(
-    linhas: &[Linha],
-    titulo: &str,
-    larg_total: usize,
-    larg_barra: usize,
-    pico: f64,
-) -> Vec<Line<'a>> {
+fn tabela_tenants<'a>(linhas: &[Linha], titulo: &str, blocos: usize) -> Vec<Line<'a>> {
     let mut corpo: Vec<Vec<Cel>> = Vec::with_capacity(linhas.len());
     for x in linhas {
         let cor = estado_tenant(x);
@@ -664,6 +689,8 @@ fn tabela_tenants<'a>(
         cels.push(cel_bytes(x.app_mem));
         cels.push(cel_pct(x.db_cpu));
         cels.push(cel_bytes(x.db_mem));
+        let tem_cpu = x.app_cpu.is_some() || x.db_cpu.is_some();
+        cels.push(cel_pct(if tem_cpu { Some(x.cpu_total()) } else { None }));
         cels.push(if !x.rep_existe {
             Cel::txt("ausente", Style::new().fg(VERMELHO), false)
         } else if !x.rep_ok {
@@ -691,32 +718,46 @@ fn tabela_tenants<'a>(
                 }
             }
         });
+        let blocos_faixa = blocos.max(19);
         cels.push(Cel::spans(
-            barra(x.cpu_total() / pico * 100.0, larg_barra),
-            larg_barra,
+            faixa_sonda(&x.hist, blocos),
+            blocos_faixa.min(blocos.max(19)),
         ));
         corpo.push(cels);
     }
 
     if corpo.is_empty() {
         let mut vazia = vec![Cel::txt("sem dados", Style::new().fg(FOSCO), false)];
-        for _ in 1..10 {
+        for _ in 1..11 {
             vazia.push(Cel::txt("", Style::new(), false));
         }
         corpo.push(vazia);
     }
 
-    let cab = vec![
-        "TENANT", "NO", "SITE", "ms", "APP", "MEM", "DB", "MEM", "REPL", "CPU",
+    let rotulo_faixa = format!("DISPONIBILIDADE {}min", cfg::get().janela_sonda);
+    let cab: Vec<&str> = vec![
+        "TENANT",
+        "NO",
+        "SITE",
+        "ms",
+        "APP",
+        "MEM",
+        "DB",
+        "MEM",
+        "CPU",
+        "REPL",
+        &rotulo_faixa,
     ];
-    let mut larguras = vec![13, 3, 4, 4, 5, 7, 5, 7, 8, larg_barra];
-    let flexivel = larguras.len() - 1;
+    let mut larguras = larguras_tenants(blocos);
+    let natural = largura_natural(&larguras);
 
     let mut saida = vec![Line::from(Span::styled(
         titulo.to_string(),
         Style::new().fg(AMBAR).add_modifier(Modifier::BOLD),
     ))];
-    saida.extend(tabela(&cab, &mut larguras, flexivel, corpo, larg_total));
+    // largura_total = natural: nada expande, porque a faixa e janela de tempo
+    // e nao proporcao. A aba centraliza a tabela no lugar de esticar
+    saida.extend(tabela(&cab, &mut larguras, 0, corpo, natural));
     saida
 }
 
@@ -818,7 +859,6 @@ pub fn aba_cluster(
 ) {
     let guarda = cluster.lock().unwrap();
     let linhas: Vec<Linha> = guarda.tenants.clone();
-    let pico = guarda.escala_cpu();
     let topo = resumo_cluster(&guarda, unidades);
     drop(guarda);
 
@@ -837,20 +877,40 @@ pub fn aba_cluster(
 
     // uma lista so, ordenada por no. Duas tabelas lado a lado mostravam o
     // balanceamento, mas quebravam a leitura: o olho ia e voltava entre as
-    // metades. A coluna NO ja agrupa, e a barra de CPU segue em escala comum,
-    // entao a comparacao entre nos nao se perde. A barra leva toda a sobra da
-    // largura: com teto fixo sobrava um vao morto a direita.
+    // metades. A coluna NO ja agrupa.
     let mut ordenadas = linhas.clone();
     ordenadas.sort_by(|a, b| a.no.cmp(&b.no).then(a.tenant.cmp(&b.tenant)));
-    let larg_b = (partes[1].width as usize).saturating_sub(84).max(8);
-    let tab = tabela_tenants(
-        &ordenadas,
-        "TENANTS",
-        partes[1].width as usize,
-        larg_b,
-        pico,
-    );
-    f.render_widget(Paragraph::new(tab), partes[1]);
+
+    let blocos = cfg::get().blocos_sonda;
+    let mut tab = tabela_tenants(&ordenadas, "TENANTS", blocos);
+    tab.push(Line::from(""));
+    tab.push(Line::from(vec![
+        fosco("faixa  "),
+        Span::styled("█", Style::new().fg(VERDE)),
+        fosco(" respondendo   "),
+        Span::styled("█", Style::new().fg(VERMELHO)),
+        fosco(" sem responder   "),
+        fosco("░"),
+        fosco(format!(
+            " sem dado   1 bloco = {} min, o mais recente a direita",
+            (cfg::get().janela_sonda / blocos.max(1) as i64).max(1)
+        )),
+    ]));
+
+    // a tabela nao estica: tem largura natural, entao vai centralizada
+    let natural = largura_natural(&larguras_tenants(blocos)) as u16;
+    let corpo = if natural < partes[1].width {
+        let folga = (partes[1].width - natural) / 2;
+        Rect {
+            x: partes[1].x + folga,
+            y: partes[1].y,
+            width: natural,
+            height: partes[1].height,
+        }
+    } else {
+        partes[1]
+    };
+    f.render_widget(Paragraph::new(tab), corpo);
 }
 
 // ------------------------------------------------------------ DIAGRAMA ---

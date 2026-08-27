@@ -633,7 +633,6 @@ fn tabela_tenants<'a>(
     larg_total: usize,
     larg_barra: usize,
     pico: f64,
-    mostrar_no: bool,
 ) -> Vec<Line<'a>> {
     let mut corpo: Vec<Vec<Cel>> = Vec::with_capacity(linhas.len());
     for x in linhas {
@@ -647,9 +646,7 @@ fn tabela_tenants<'a>(
             Style::new().fg(cor),
             false,
         )];
-        if mostrar_no {
-            cels.push(Cel::txt(x.no.clone(), Style::new().fg(CIANO), false));
-        }
+        cels.push(Cel::txt(x.no.clone(), Style::new().fg(CIANO), false));
         cels.push(match x.site {
             None => Cel::txt("?", Style::new().fg(FOSCO), false),
             Some(v) if v == 1.0 => Cel::txt("UP", Style::new().fg(VERDE), false),
@@ -702,27 +699,17 @@ fn tabela_tenants<'a>(
     }
 
     if corpo.is_empty() {
-        let n = if mostrar_no { 10 } else { 9 };
         let mut vazia = vec![Cel::txt("sem dados", Style::new().fg(FOSCO), false)];
-        for _ in 1..n {
+        for _ in 1..10 {
             vazia.push(Cel::txt("", Style::new(), false));
         }
         corpo.push(vazia);
     }
 
-    let (cab, mut larguras): (Vec<&str>, Vec<usize>) = if mostrar_no {
-        (
-            vec![
-                "TENANT", "NO", "SITE", "ms", "APP", "MEM", "DB", "MEM", "REPL", "CPU",
-            ],
-            vec![13, 3, 4, 4, 5, 7, 5, 7, 8, larg_barra],
-        )
-    } else {
-        (
-            vec!["TENANT", "SITE", "ms", "APP", "MEM", "DB", "MEM", "REPL", "CPU"],
-            vec![13, 4, 4, 5, 7, 5, 7, 8, larg_barra],
-        )
-    };
+    let cab = vec![
+        "TENANT", "NO", "SITE", "ms", "APP", "MEM", "DB", "MEM", "REPL", "CPU",
+    ];
+    let mut larguras = vec![13, 3, 4, 4, 5, 7, 5, 7, 8, larg_barra];
     let flexivel = larguras.len() - 1;
 
     let mut saida = vec![Line::from(Span::styled(
@@ -848,56 +835,22 @@ pub fn aba_cluster(
     f.render_widget(b, partes[0]);
     f.render_widget(Paragraph::new(topo), dentro);
 
-    // em terminal largo divide por no, que e a vista que mostra
-    // desbalanceamento; em terminal estreito uma tabela so, senao as colunas
-    // somem
-    let com_caixa: Vec<String> = cfg::get()
-        .nos
-        .iter()
-        .filter(|n| !n.caixa.is_empty())
-        .map(|n| {
-            if n.sigla.is_empty() {
-                n.nome.chars().take(3).collect()
-            } else {
-                n.sigla.clone()
-            }
-        })
-        .collect();
-
-    // exatamente dois: com tres ou mais nos hospedando tenant, duas colunas
-    // esconderiam um deles em silencio, e a tabela unica mostra a coluna NO
-    if partes[1].width >= 156 && !linhas.is_empty() && com_caixa.len() == 2 {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
-            .split(partes[1]);
-        let larg_b = (((partes[1].width as usize).saturating_sub(160)) / 2 + 8).clamp(8, 24);
-        for (i, sig) in com_caixa.iter().enumerate() {
-            let desta: Vec<Linha> = linhas.iter().filter(|x| &x.no == sig).cloned().collect();
-            let tab = tabela_tenants(
-                &desta,
-                &format!("{} · {} TENANTS", sig, desta.len()),
-                cols[i].width as usize,
-                larg_b,
-                pico,
-                false,
-            );
-            f.render_widget(Paragraph::new(tab), cols[i]);
-        }
-    } else {
-        let mut ordenadas = linhas.clone();
-        ordenadas.sort_by(|a, b| a.no.cmp(&b.no).then(a.tenant.cmp(&b.tenant)));
-        let larg_b = ((partes[1].width as usize).saturating_sub(82)).clamp(8, 48);
-        let tab = tabela_tenants(
-            &ordenadas,
-            "TENANTS",
-            partes[1].width as usize,
-            larg_b,
-            pico,
-            true,
-        );
-        f.render_widget(Paragraph::new(tab), partes[1]);
-    }
+    // uma lista so, ordenada por no. Duas tabelas lado a lado mostravam o
+    // balanceamento, mas quebravam a leitura: o olho ia e voltava entre as
+    // metades. A coluna NO ja agrupa, e a barra de CPU segue em escala comum,
+    // entao a comparacao entre nos nao se perde. A barra leva toda a sobra da
+    // largura: com teto fixo sobrava um vao morto a direita.
+    let mut ordenadas = linhas.clone();
+    ordenadas.sort_by(|a, b| a.no.cmp(&b.no).then(a.tenant.cmp(&b.tenant)));
+    let larg_b = (partes[1].width as usize).saturating_sub(84).max(8);
+    let tab = tabela_tenants(
+        &ordenadas,
+        "TENANTS",
+        partes[1].width as usize,
+        larg_b,
+        pico,
+    );
+    f.render_widget(Paragraph::new(tab), partes[1]);
 }
 
 // ------------------------------------------------------------ DIAGRAMA ---

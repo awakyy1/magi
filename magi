@@ -1327,7 +1327,7 @@ def pico_cpu(linhas):
                default=0) or 1.0
 
 
-def tabela_tenants(linhas, titulo, larg_barra=10, pico=None, mostrar_no=True):
+def tabela_tenants(linhas, titulo, larg_barra=10):
     # rotulo curto e fixo: cortar o nome do servico em 5 letras produzia
     # cabecalho feio ('mariadb' virava 'MARIA'). O nome completo do servico
     # aparece na aba da unidade, no nome da task
@@ -1336,8 +1336,7 @@ def tabela_tenants(linhas, titulo, larg_barra=10, pico=None, mostrar_no=True):
                 header_style='bold %s' % LARANJA, title=titulo,
                 title_style='bold %s' % AMBAR, pad_edge=False, padding=(0, 1))
     tab.add_column('TENANT', style=AMBAR, no_wrap=True, width=13)
-    if mostrar_no:
-        tab.add_column('NO', justify='center', width=3)
+    tab.add_column('NO', justify='center', width=3)
     tab.add_column('SITE', justify='center', width=4)
     tab.add_column('ms', justify='right', width=4)
     tab.add_column(rot_app, justify='right', width=5)
@@ -1350,12 +1349,10 @@ def tabela_tenants(linhas, titulo, larg_barra=10, pico=None, mostrar_no=True):
     tab.add_column('CPU', justify='left', ratio=1, min_width=8)
 
     if not linhas:
-        tab.add_row(Text('sem dados', style=FOSCO),
-                    *[''] * (9 if mostrar_no else 8))
+        tab.add_row(Text('sem dados', style=FOSCO), *[''] * 9)
         return tab
 
-    if pico is None:
-        pico = pico_cpu(linhas)
+    pico = pico_cpu(linhas)
 
     for x in linhas:
         cor = estado_tenant(x)
@@ -1379,18 +1376,17 @@ def tabela_tenants(linhas, titulo, larg_barra=10, pico=None, mostrar_no=True):
                        LARANJA_FORTE if lag < 300 else VERMELHO)
             repl = Text('%s %ds' % (x['no_rep'], int(lag)), style=cor_lag)
 
-        celulas = [Text('%s %s' % ('●' if cor == VERDE else '○',
-                                   x['tenant'][:11]), style=cor)]
-        if mostrar_no:
-            celulas.append(Text(x['no'], style=CIANO))
         soma_cpu = (x['app_cpu'] or 0) + (x['db_cpu'] or 0)
-        tab.add_row(*celulas + [
+        tab.add_row(
+            Text('%s %s' % ('●' if cor == VERDE else '○', x['tenant'][:11]),
+                 style=cor),
+            Text(x['no'], style=CIANO),
             site, ms,
             _cel_pct(x['app_cpu']), _cel_bytes(x['app_mem']),
             _cel_pct(x['db_cpu']), _cel_bytes(x['db_mem']),
             repl,
             barra(soma_cpu / pico * 100, larg_barra),
-        ])
+        )
     return tab
 
 
@@ -1467,35 +1463,16 @@ def aba_cluster(cluster, unidades):
         linhas = list(cluster.tenants)
     topo = painel_resumo_cluster(cluster, unidades)
 
-    # em terminal largo divide por no, que e o que mostra balanceamento;
-    # em terminal estreito uma tabela so, senao as colunas somem
-    com_caixa = [u for u in unidades if getattr(u, 'caixa', '')]
-    if largura_terminal() >= 156 and linhas and len(com_caixa) > 1:
-        grid = Table.grid(expand=True, padding=(0, 2))
-        grid.add_column(ratio=1)
-        grid.add_column(ratio=1)
-        siglas = [getattr(u, 'sigla', u.nome[:3]) for u in com_caixa]
-        pico = pico_cpu(linhas)
-        larg_b = max(8, min(24, (largura_terminal() - 160) // 2 + 8))
-        blocos = []
-        for sig in siglas:
-            desta = [x for x in linhas if x['no'] == sig]
-            blocos.append(tabela_tenants(
-                desta, '%s · %d TENANTS' % (sig, len(desta)), larg_b, pico,
-                mostrar_no=False))
-        orfaos = [x for x in linhas if x['no'] not in siglas]
-        if orfaos:
-            blocos.append(tabela_tenants(orfaos, 'SEM NO IDENTIFICADO',
-                                         larg_b, pico))
-        while len(blocos) % 2:
-            blocos.append(Text(''))
-        for i in range(0, len(blocos), 2):
-            grid.add_row(blocos[i], blocos[i + 1])
-        corpo = grid
-    else:
-        corpo = tabela_tenants(
-            sorted(linhas, key=lambda x: (x['no'], x['tenant'])), 'TENANTS',
-            max(8, min(48, largura_terminal() - 82)))
+    # uma lista so, ordenada por no. Duas tabelas lado a lado mostravam o
+    # balanceamento, mas quebravam a leitura: o olho ia e voltava entre as
+    # metades. A coluna NO ja agrupa, e a barra de CPU segue em escala comum,
+    # entao a comparacao entre nos nao se perde.
+    #
+    # A barra leva toda a sobra da largura: com teto fixo sobrava um vao morto
+    # a direita da tabela em terminal largo.
+    corpo = tabela_tenants(
+        sorted(linhas, key=lambda x: (x['no'], x['tenant'])), 'TENANTS',
+        max(8, largura_terminal() - 84))
     return Group(topo, Text(''), corpo)
 
 

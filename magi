@@ -1374,7 +1374,10 @@ def faixa_sonda(valores, largura=BLOCOS_SONDA):
     if faltam > 0:
         t.append('░' * faltam, style=FOSCO)
     for v in valores[-largura:]:
-        t.append('█', style=VERDE if v >= 1 else VERMELHO)
+        # meio-bloco, nao bloco cheio: deixa uma folga a direita de cada
+        # celula, entao a faixa se le como blocos de tempo separados em vez
+        # de virar uma barra continua
+        t.append('▌', style=VERDE if v >= 1 else VERMELHO)
     return t
 
 
@@ -1528,9 +1531,9 @@ def aba_cluster(cluster, unidades):
                            'TENANTS')
     legenda = Text()
     legenda.append('faixa  ', style=FOSCO)
-    legenda.append('█', style=VERDE)
+    legenda.append('▌', style=VERDE)
     legenda.append(' respondendo   ', style=FOSCO)
-    legenda.append('█', style=VERMELHO)
+    legenda.append('▌', style=VERMELHO)
     legenda.append(' sem responder   ', style=FOSCO)
     legenda.append('░', style=FOSCO)
     legenda.append(' sem dado   1 bloco = %d min, o mais recente a direita'

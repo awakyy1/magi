@@ -626,8 +626,11 @@ fn faixa_sonda<'a>(valores: &[f64], largura: usize) -> Vec<Span<'a>> {
     }
     let ini = valores.len().saturating_sub(largura);
     for v in &valores[ini..] {
+        // meio-bloco, nao bloco cheio: deixa uma folga a direita de cada
+        // celula, entao a faixa se le como blocos de tempo separados em vez
+        // de virar uma barra continua
         spans.push(Span::styled(
-            "█",
+            "▌",
             Style::new().fg(if *v >= 1.0 { VERDE } else { VERMELHO }),
         ));
     }
@@ -886,9 +889,9 @@ pub fn aba_cluster(
     tab.push(Line::from(""));
     tab.push(Line::from(vec![
         fosco("faixa  "),
-        Span::styled("█", Style::new().fg(VERDE)),
+        Span::styled("▌", Style::new().fg(VERDE)),
         fosco(" respondendo   "),
-        Span::styled("█", Style::new().fg(VERMELHO)),
+        Span::styled("▌", Style::new().fg(VERMELHO)),
         fosco(" sem responder   "),
         fosco("░"),
         fosco(format!(

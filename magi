@@ -1305,9 +1305,10 @@ def tabela_latencia(unidades):
     """Latencia real (handshake TCP) desta maquina ate cada unidade pela
     tailnet, com historico em faisca. Substitui a antiga tabela de deriva
     de relogio entre nos, que nao dizia nada de util na pratica."""
-    tab = Table(expand=True, border_style=FOSCO, header_style='bold %s' % LARANJA,
-                title='latencia ate cada unidade (tailnet)', title_style=FOSCO,
-                title_justify='left')
+    # sem titulo: o cabecalho das colunas ja diz o que e, e a linha solta em
+    # cima da tabela ficava sobrando na tela
+    tab = Table(expand=True, border_style=FOSCO,
+                header_style='bold %s' % LARANJA)
     tab.add_column('UNIDADE', style='bold %s' % AMBAR)
     tab.add_column('PING', justify='right')
     tab.add_column('HISTORICO', justify='left')
@@ -1544,7 +1545,126 @@ def aba_cluster(cluster, unidades):
                  Align.center(legenda))
 
 
-def aba_diagrama(unidades):
+def _por_no(cluster, unidades):
+    """Tenants, memoria e replicas por no, so com o que a aba CLUSTER ja tem."""
+    with cluster.lock:
+        linhas = list(cluster.tenants)
+    dados = {}
+    for u in unidades:
+        if not getattr(u, 'caixa', ''):
+            continue
+        dados[getattr(u, 'sigla', u.nome[:3])] = {'rotulo': u.rotulo, 'unidade': u, 'tenants': 0,
+                          'mem': 0.0, 'replicas': 0, 'destino': '',
+                          'lag': None, 'paradas': 0}
+    for x in linhas:
+        d = dados.get(x['no'])
+        if d is not None:
+            d['tenants'] += 1
+            d['mem'] += (x['app_mem'] or 0) + (x['db_mem'] or 0)
+        r = dados.get(x['no_rep'])
+        if r is not None and x['rep'][0]:
+            r['replicas'] += 1
+            r['destino'] = x['no']
+            if x['rep'][2] is not None:
+                r['lag'] = max(r['lag'] or 0, x['rep'][2])
+            if not x['rep'][1]:
+                r['paradas'] += 1
+    return dados, linhas
+
+
+def _linha_failover(dados):
+    """Se um no cair, o parceiro aguenta os tenants dele pela memoria?
+
+    A conta e a memoria dos tenants do no que caiu somada ao que o parceiro
+    ja usa, contra o teto de seguranca do parceiro. So faz sentido entre nos
+    que hospedam tenant, entao a MELCHIOR fica fora enquanto nao tiver disco.
+    """
+    siglas = [k for k, d in dados.items() if d['tenants']]
+    if len(siglas) != 2:
+        return Text('failover  precisa de dois nos com tenant para a conta',
+                    style=FOSCO)
+    saida = Text()
+    for cai, fica in ((siglas[0], siglas[1]), (siglas[1], siglas[0])):
+        u = dados[fica]['unidade']
+        if not u.mem_total:
+            continue
+        depois = (u.mem_usada + dados[cai]['mem']) / u.mem_total * 100
+        cor = VERDE if depois < TETO_MEM * 100 else LARANJA_FORTE
+        if saida.plain:
+            saida.append('  ', style=FOSCO)
+        else:
+            saida.append('failover  ', style=FOSCO)
+        saida.append('%s cai: ' % cai, style=AMBAR)
+        saida.append('%s %.0f%%' % (fica, depois), style=cor)
+    return saida
+
+
+def painel_cluster(cluster, unidades):
+    """Rodape da aba: o cluster visto por no, e nao tenant por tenant.
+
+    Tudo daqui ja foi coletado para a aba CLUSTER, entao nao gera consulta
+    nova. A pergunta que este painel responde e a que o diagrama de cima nao
+    responde: como a carga esta dividida, para onde cada metade replica, e se
+    sobra folga para absorver a queda de um no.
+    """
+    dados, linhas = _por_no(cluster, unidades)
+
+    esq = [Text('CARGA POR NO', style='bold %s' % LARANJA)]
+    pico = max((d['mem'] for d in dados.values()), default=0) or 1.0
+    for sig, d in dados.items():
+        t = Text()
+        t.append('%-4s ' % sig, style=CIANO)
+        t.append('%2d tenants  ' % d['tenants'], style=AMBAR)
+        t.append('%9s  ' % (bytes_h(d['mem']) if d['mem'] else '-'),
+                 style=AMBAR if d['mem'] else FOSCO)
+        t.append_text(barra(d['mem'] / pico * 100, 14))
+        esq.append(t)
+    esq.append(_linha_failover(dados))
+
+    dir_ = [Text('REPLICACAO E DISPONIBILIDADE', style='bold %s' % LARANJA)]
+    for sig, d in dados.items():
+        t = Text()
+        t.append('%-4s ' % sig, style=CIANO)
+        if not d['replicas']:
+            t.append('nao guarda replica', style=FOSCO)
+        else:
+            t.append('guarda %d de %s  ' % (d['replicas'], d['destino']),
+                     style=AMBAR)
+            if d['paradas']:
+                t.append('%d PARADAS' % d['paradas'],
+                         style='bold %s' % VERMELHO)
+            else:
+                t.append('lag %ds' % int(d['lag'] or 0), style=VERDE)
+        dir_.append(t)
+
+    blocos = [v for x in linhas for v in x['hist']]
+    caidos = [x['tenant'] for x in linhas if any(v < 1 for v in x['hist'])]
+    t = Text()
+    t.append('%dmin  ' % JANELA_SONDA, style=FOSCO)
+    if blocos:
+        pct = sum(1 for v in blocos if v >= 1) / len(blocos) * 100
+        t.append('%.2f%%' % pct,
+                 style=VERDE if pct >= 99.9 else LARANJA_FORTE)
+        t.append('  ', style=FOSCO)
+        if caidos:
+            t.append('oscilou %s' % ', '.join(caidos[:2]),
+                     style=LARANJA_FORTE)
+            if len(caidos) > 2:
+                t.append(' +%d' % (len(caidos) - 2), style=FOSCO)
+        else:
+            t.append('sem oscilacao', style=VERDE)
+    else:
+        t.append('sem historico ainda', style=FOSCO)
+    dir_.append(t)
+
+    grid = Table.grid(expand=True, padding=(0, 3))
+    grid.add_column(ratio=1)
+    grid.add_column(ratio=1)
+    grid.add_row(Group(*esq), Group(*dir_))
+    return Panel(grid, border_style=FOSCO, padding=(0, 1))
+
+
+def aba_diagrama(unidades, cluster=None):
     """Diagrama triangular das tres unidades, no estilo da tela do MAGI
     quando o sistema e atacado no anime: cada no e o seu proprio selo, sem
     fingir um voto agregado que o cluster ainda nao tem condicao de emitir.
@@ -1556,6 +1676,8 @@ def aba_diagrama(unidades):
     linhas.append(Align.center(painel_unidades(unidades)))
     linhas.append(Text(''))
     linhas.append(tabela_latencia(unidades))
+    if cluster is not None and TEM_CLUSTER:
+        linhas.append(painel_cluster(cluster, unidades))
 
     return Panel(Group(*linhas), border_style=FOSCO, padding=(1, 2))
 
@@ -1776,7 +1898,7 @@ def main():
                 elif TEM_CLUSTER and aba == total_abas - 1:
                     layout['corpo'].update(aba_cluster(cluster, unidades))
                 elif aba == 1 + len(unidades):
-                    layout['corpo'].update(aba_diagrama(unidades))
+                    layout['corpo'].update(aba_diagrama(unidades, cluster))
                 else:
                     layout['corpo'].update(
                         aba_unidade(unidades[aba - 1]))

@@ -42,12 +42,30 @@ impl Linha {
     }
 }
 
+/// Estado de um decisor de failover que viva FORA do cluster.
+///
+/// Ele nao e um no, entao nao aparece em nenhuma aba por unidade. Mas e quem
+/// promoveria a replica numa queda: se parar de avaliar, nada fica vermelho e
+/// ninguem percebe. Por isso ganha uma linha propria no rodape.
+#[derive(Clone, Default)]
+pub struct Decisor {
+    /// Falso enquanto nao houver metrica nenhuma publicada por ele.
+    pub presente: bool,
+    pub modo: String,
+    pub janela: String,
+    pub autoteste: Option<bool>,
+    pub idade: Option<f64>,
+    pub candidatos: Vec<String>,
+    pub mudos: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct Cluster {
     pub tenants: Vec<Linha>,
     pub erro: String,
     /// Epoch em segundos da ultima coleta boa; None enquanto nao houver uma.
     pub atualizado: Option<f64>,
+    pub decisor: Option<Decisor>,
 }
 
 pub struct Resumo {
@@ -95,6 +113,7 @@ impl Cluster {
                 self.tenants = linhas;
                 self.erro.clear();
                 self.atualizado = Some(coleta::agora_epoch());
+                self.decisor = buscar_decisor();
             }
             Err(e) => self.erro = e,
         }
@@ -139,6 +158,40 @@ fn sigla_da_caixa(caixa: &str) -> String {
         }
     }
     "?".into()
+}
+
+/// Le o estado do decisor de failover, se a instalacao tiver um configurado.
+///
+/// Segue a convencao de nomes do prefixo: com `decisor`, procura
+/// `decisor_failover_info` (labels `modo` e `janela_min`), `decisor_autoteste`,
+/// `decisor_ultima_avaliacao_timestamp`, `decisor_no_candidato` e
+/// `decisor_no_caminho`. Sem prefixo nao faz consulta nenhuma.
+pub fn buscar_decisor() -> Option<Decisor> {
+    let p = match &cfg::get().cluster {
+        Some(c) if !c.decisor.is_empty() => c.decisor.clone(),
+        _ => return None,
+    };
+    let info = coleta::prom_series(&format!("{}_failover_info", p));
+    if info.is_empty() {
+        return Some(Decisor::default());
+    }
+    let at = coleta::prom_series(&format!("{}_autoteste", p));
+    let idade = coleta::prom_series(&format!("time() - {}_ultima_avaliacao_timestamp", p));
+    Some(Decisor {
+        presente: true,
+        modo: info[0].rotulo("modo").to_string(),
+        janela: info[0].rotulo("janela_min").to_string(),
+        autoteste: at.first().map(|x| x.valor >= 1.0),
+        idade: idade.first().map(|x| x.valor),
+        candidatos: coleta::prom_series(&format!("{}_no_candidato == 1", p))
+            .iter()
+            .map(|x| x.rotulo("no").to_string())
+            .collect(),
+        mudos: coleta::prom_series(&format!("{}_no_caminho == 0", p))
+            .iter()
+            .map(|x| format!("{} {}", x.rotulo("no"), x.rotulo("caminho")))
+            .collect(),
+    })
 }
 
 /// Faz a rede e le os containers ja coletados. Roda fora do mutex do Cluster:

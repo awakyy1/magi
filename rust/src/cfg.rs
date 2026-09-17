@@ -59,6 +59,9 @@ pub struct ClusterCfg {
     /// Nome do servico da aplicacao dentro da stack de cada tenant.
     pub servico_app: String,
     pub servico_banco: String,
+    /// Prefixo das metricas de um decisor de failover que viva FORA do
+    /// cluster. Vazio desliga a linha e nao faz consulta nenhuma.
+    pub decisor: String,
 }
 
 pub struct Config {
@@ -157,6 +160,7 @@ pub fn carregar() -> Result<(), String> {
             label_box: bc["label_box"].as_str().unwrap_or("box").to_string(),
             servico_app: bc["servico_app"].as_str().unwrap_or("").to_string(),
             servico_banco: bc["servico_banco"].as_str().unwrap_or("").to_string(),
+            decisor: bc["decisor"].as_str().unwrap_or("").to_string(),
         }),
         _ => None,
     };

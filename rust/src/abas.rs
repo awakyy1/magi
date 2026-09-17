@@ -925,7 +925,9 @@ struct PorNo {
     tenants: usize,
     mem: f64,
     replicas: usize,
-    destino: String,
+    /// De quais nos vieram as replicas que esta box guarda. Um unico destino
+    /// nao serve: com tres nos ou mais, uma box guarda copia de mais de um.
+    origens: Vec<(String, usize)>,
     lag: Option<f64>,
     paradas: usize,
     mem_usada: f64,
@@ -950,7 +952,7 @@ fn por_no(linhas: &[Linha], unidades: &[Arc<Mutex<Unidade>>]) -> Vec<PorNo> {
             tenants: 0,
             mem: 0.0,
             replicas: 0,
-            destino: String::new(),
+            origens: Vec::new(),
             lag: None,
             paradas: 0,
             mem_usada: g.mem_usada,
@@ -965,7 +967,10 @@ fn por_no(linhas: &[Linha], unidades: &[Arc<Mutex<Unidade>>]) -> Vec<PorNo> {
         if x.rep_existe {
             if let Some(r) = saida.iter_mut().find(|d| d.sigla == x.no_rep) {
                 r.replicas += 1;
-                r.destino = x.no.clone();
+                match r.origens.iter_mut().find(|(o, _)| *o == x.no) {
+                    Some(e) => e.1 += 1,
+                    None => r.origens.push((x.no.clone(), 1)),
+                }
                 if let Some(l) = x.rep_lag {
                     r.lag = Some(r.lag.map_or(l, |a: f64| a.max(l)));
                 }
@@ -978,36 +983,127 @@ fn por_no(linhas: &[Linha], unidades: &[Arc<Mutex<Unidade>>]) -> Vec<PorNo> {
     saida
 }
 
-/// Se um no cair, o parceiro aguenta os tenants dele pela memoria?
+/// Se um no cair, para onde vao os tenants dele e como fica a memoria de la?
 ///
-/// A conta e a memoria dos tenants do que caiu somada ao que o parceiro ja
-/// usa, contra o total dele. So faz sentido entre nos que hospedam tenant.
-fn linha_failover<'a>(dados: &[PorNo]) -> Vec<Span<'a>> {
+/// Com dois nos a conta era trivial: o parceiro absorvia tudo. Com tres ou
+/// mais, "o parceiro" deixa de existir, e escolher o no com mais folga na hora
+/// tambem esta errado: um tenant so pode voltar onde a copia quente dele ja
+/// esta. Entao agrupa os tenants do no caido pelo no que guarda a replica de
+/// cada um. Quem nao tem replica e contado a parte: e o que ficaria fora do ar.
+fn linha_failover<'a>(dados: &[PorNo], linhas: &[Linha]) -> Vec<Span<'a>> {
     let com: Vec<&PorNo> = dados.iter().filter(|d| d.tenants > 0).collect();
-    if com.len() != 2 {
-        return vec![fosco("failover  precisa de dois nos com tenant")];
+    if com.len() < 2 {
+        return vec![fosco("failover  precisa de pelo menos dois nos com tenant")];
     }
-    let mut spans = vec![fosco("failover  ")];
-    for (cai, fica) in [(com[0], com[1]), (com[1], com[0])] {
-        if fica.mem_total <= 0.0 {
+    let mut spans: Vec<Span> = Vec::new();
+    for cai in &com {
+        let mut peso: Vec<(String, f64)> = Vec::new();
+        let mut orfaos = 0usize;
+        for x in linhas.iter().filter(|x| x.no == cai.sigla) {
+            let guarda = if x.rep_existe { x.no_rep.clone() } else { String::new() };
+            let conhecido = !guarda.is_empty()
+                && guarda != cai.sigla
+                && dados.iter().any(|d| d.sigla == guarda);
+            if !conhecido {
+                orfaos += 1;
+                continue;
+            }
+            let m = x.app_mem.unwrap_or(0.0) + x.db_mem.unwrap_or(0.0);
+            match peso.iter_mut().find(|(g, _)| *g == guarda) {
+                Some(e) => e.1 += m,
+                None => peso.push((guarda, m)),
+            }
+        }
+        if peso.is_empty() && orfaos == 0 {
             continue;
         }
-        let depois = (fica.mem_usada + cai.mem) / fica.mem_total * 100.0;
-        if spans.len() > 1 {
-            spans.push(fosco("  "));
+        if spans.is_empty() {
+            spans.push(fosco("failover  "));
+        } else {
+            spans.push(fosco("   "));
         }
         spans.push(Span::styled(
             format!("{} cai: ", cai.sigla),
             Style::new().fg(AMBAR),
         ));
+        peso.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut primeiro = true;
+        for (sig, m) in &peso {
+            let d = match dados.iter().find(|d| d.sigla == *sig) {
+                Some(d) if d.mem_total > 0.0 => d,
+                _ => continue,
+            };
+            let depois = (d.mem_usada + m) / d.mem_total * 100.0;
+            if !primeiro {
+                spans.push(fosco("+"));
+            }
+            primeiro = false;
+            spans.push(Span::styled(
+                format!("{} {:.0}% ", sig, depois),
+                Style::new().fg(if depois < TETO_MEM * 100.0 {
+                    VERDE
+                } else {
+                    LARANJA_FORTE
+                }),
+            ));
+        }
+        if orfaos > 0 {
+            spans.push(fosco(format!("{} sem replica ", orfaos)));
+        }
+    }
+    spans
+}
+
+/// Uma linha para o decisor de failover, quando ha um configurado.
+///
+/// Le, nesta ordem: ha quanto tempo avaliou, se passa no proprio autoteste, se
+/// esta armado ou so observando, e entao ou os caminhos que emudeceram ou o no
+/// que ele considera caido.
+fn linha_decisor<'a>(d: &crate::cluster::Decisor) -> Vec<Span<'a>> {
+    let mut spans = vec![fosco("decisor   ")];
+    if !d.presente {
+        spans.push(Span::styled("sem metrica", Style::new().fg(LARANJA_FORTE)));
+        return spans;
+    }
+    match d.idade {
+        None => spans.push(Span::styled("sem leitura  ", Style::new().fg(LARANJA_FORTE))),
+        Some(i) if i > 180.0 => spans.push(Span::styled(
+            format!("PAROU ha {:.0}min  ", i / 60.0),
+            Style::new().fg(VERMELHO).add_modifier(Modifier::BOLD),
+        )),
+        Some(i) => spans.push(Span::styled(
+            format!("ha {:.0}s  ", i),
+            Style::new().fg(VERDE),
+        )),
+    }
+    match d.autoteste {
+        Some(false) => spans.push(Span::styled(
+            "ABSTEM  ",
+            Style::new().fg(VERMELHO).add_modifier(Modifier::BOLD),
+        )),
+        Some(true) => spans.push(Span::styled("enxergando  ", Style::new().fg(VERDE))),
+        None => {}
+    }
+    let modo = if d.modo.is_empty() { "?" } else { &d.modo };
+    if modo == "armado" {
+        spans.push(Span::styled(format!("{}  ", modo), Style::new().fg(AMBAR)));
+    } else {
+        spans.push(fosco(format!("{}  ", modo)));
+    }
+    if !d.candidatos.is_empty() {
         spans.push(Span::styled(
-            format!("{} {:.0}%", fica.sigla, depois),
-            Style::new().fg(if depois < TETO_MEM * 100.0 {
-                VERDE
-            } else {
-                LARANJA_FORTE
-            }),
+            format!("QUEDA: {}", d.candidatos.join(", ")),
+            Style::new().fg(VERMELHO).add_modifier(Modifier::BOLD),
         ));
+    } else if !d.mudos.is_empty() {
+        let ate2: Vec<String> = d.mudos.iter().take(2).cloned().collect();
+        spans.push(Span::styled(
+            format!("mudo: {}", ate2.join(", ")),
+            Style::new().fg(LARANJA_FORTE),
+        ));
+    } else {
+        let j = if d.janela.is_empty() { "?" } else { &d.janela };
+        spans.push(fosco(format!("caminhos ok, janela {}min", j)));
     }
     spans
 }
@@ -1047,7 +1143,10 @@ fn painel_cluster<'a>(
         l.extend(barra(d.mem / pico * 100.0, 14));
         esq.push(l);
     }
-    esq.push(linha_failover(&dados));
+    esq.push(linha_failover(&dados, &linhas_t));
+    if let Some(d) = { cluster.lock().unwrap().decisor.clone() } {
+        esq.push(linha_decisor(&d));
+    }
 
     let mut dir: Vec<Vec<Span>> = vec![vec![Span::styled(
         "REPLICACAO E DISPONIBILIDADE",
@@ -1061,10 +1160,14 @@ fn painel_cluster<'a>(
         if d.replicas == 0 {
             l.push(fosco("nao guarda replica"));
         } else {
+            let mut org = d.origens.clone();
+            org.sort_by(|a, b| b.1.cmp(&a.1));
+            let de: Vec<String> = org.iter().map(|(o, q)| format!("{} {}", q, o)).collect();
             l.push(Span::styled(
-                format!("guarda {} de {}  ", d.replicas, d.destino),
+                format!("guarda {}  ", d.replicas),
                 Style::new().fg(AMBAR),
             ));
+            l.push(fosco(format!("({})  ", de.join(", "))));
             if d.paradas > 0 {
                 l.push(Span::styled(
                     format!("{} PARADAS", d.paradas),

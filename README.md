@@ -47,7 +47,8 @@ appears:
   "label_tenant": "tenant",
   "label_box": "box",
   "servico_app": "app",
-  "servico_banco": "db"
+  "servico_banco": "db",
+  "decisor": ""
 }
 ```
 
@@ -56,6 +57,47 @@ columns simply stay empty. To place tenants on nodes, give each node a `caixa`
 (the value your database metrics carry in the `label_box` label) and a short
 `sigla`. From 156 columns wide the tab splits per node side by side, which is
 the view that shows imbalance.
+
+### Where a node's tenants would go
+
+The footer of the `DIAGRAMA` tab answers the question a per-tenant table does
+not: if this node dies, where does its work land, and does the destination
+survive the extra load?
+
+Early on this was a two-node calculation, and it assumed the partner absorbs
+everything. That breaks with three nodes, and picking "the node with the most
+headroom" at failure time is wrong for a subtler reason: **a tenant can only
+come back up where its hot copy already is.** So the line groups the fallen
+node's tenants by the node that holds each replica, adds that memory to what
+the destination already uses, and shows the result per destination. Tenants
+with no replica are counted separately, because that is exactly what would
+stay down.
+
+The same footer shows which node holds whose replicas, as `guarda 12 (6 BAL,
+6 MEL)`. One node holding copies from two different nodes is normal once the
+cluster is larger than a pair.
+
+### The failover decisor
+
+If something outside the cluster decides when a node is dead, point the
+`decisor` key at the prefix of the metrics it publishes and a line appears in
+the same footer:
+
+```
+decisor   ha 13s  enxergando  observando  caminhos ok, janela 8min
+```
+
+It reads, in order: how long ago it evaluated, whether it passes its own
+self-test, whether it is armed or only watching, and then either the paths
+that went silent or the node it considers down. With the prefix `decisor` it
+looks for `decisor_failover_info` (labels `modo` and `janela_min`),
+`decisor_autoteste`, `decisor_ultima_avaliacao_timestamp`,
+`decisor_no_candidato` and `decisor_no_caminho`.
+
+The reason it earns a line at all: a decisor lives outside the cluster on
+purpose, so it appears in none of the per-node tabs. If it quietly stops, no
+tab goes red and nobody is evaluating anything. `PAROU ha 15min` in that slot
+is the whole point.
 
 ### The availability strip
 

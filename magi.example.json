@@ -25,7 +25,10 @@
     "label_tenant": "tenant",
     "label_box": "box",
     "servico_app": "app",
-    "servico_banco": "db"
+    "servico_banco": "db",
+
+    "//decisor": "opcional. Prefixo das metricas de um decisor de failover que viva FORA do cluster. Com 'decisor' o programa procura decisor_failover_info, decisor_autoteste, decisor_ultima_avaliacao_timestamp, decisor_no_candidato e decisor_no_caminho. Sem esta chave, a linha do decisor nao aparece",
+    "decisor": ""
   },
 
   "largura_ideal": 106,

@@ -84,6 +84,13 @@ SEM_CADVISOR = tuple(CONFIG.get('sem_cadvisor', []))
 CLUSTER = CONFIG.get('cluster') or {}
 TEM_CLUSTER = bool(CLUSTER.get('job_banco'))
 
+# prefixo das metricas de um decisor de failover que viva FORA do cluster. Sem
+# isso a linha do decisor nem aparece: e componente de quem tem um, nao de todo
+# mundo. Com 'decisor' o programa procura decisor_failover_info,
+# decisor_autoteste, decisor_ultima_avaliacao_timestamp, decisor_no_candidato e
+# decisor_no_caminho.
+DECISOR = CLUSTER.get('decisor', '')
+
 # faixa de disponibilidade da aba CLUSTER. Largura fixa porque a faixa e uma
 # janela de tempo, nao uma proporcao: esticar mudaria o que cada bloco vale
 JANELA_SONDA = CONFIG.get('janela_sonda', 30)
@@ -462,6 +469,7 @@ class Cluster:
         self.tenants = []
         self.erro = ''
         self.atualizado = 0.0
+        self.decisor = {}
         self.job_banco = CLUSTER.get('job_banco', '')
         self.job_replica = CLUSTER.get('job_replica', '')
         self.job_sonda = CLUSTER.get('job_sonda', '')
@@ -551,6 +559,32 @@ class Cluster:
             self.tenants = linhas
             self.erro = ''
             self.atualizado = time.time()
+            self.decisor = self._decisor()
+
+    def _decisor(self):
+        """Estado do decisor de failover, se a instalacao tiver um.
+
+        Ele vive fora do cluster de proposito, entao nao aparece em nenhuma das
+        abas por unidade. Mas e quem promoveria a replica numa queda: se ele
+        estiver parado, ninguem esta avaliando, e isso tem de ser visivel.
+        """
+        if not DECISOR:
+            return {}
+        d = {}
+        info = prom_query('%s_failover_info' % DECISOR)
+        if not info:
+            return {'ausente': True}
+        d['modo'] = info[0]['metric'].get('modo', '?')
+        d['janela'] = info[0]['metric'].get('janela_min', '?')
+        at = prom_query('%s_autoteste' % DECISOR)
+        d['autoteste'] = float(at[0]['value'][1]) >= 1 if at else None
+        idade = prom_query('time() - %s_ultima_avaliacao_timestamp' % DECISOR)
+        d['idade'] = float(idade[0]['value'][1]) if idade else None
+        d['candidatos'] = [x['metric'].get('no')
+                           for x in prom_query('%s_no_candidato == 1' % DECISOR)]
+        d['mudos'] = ['%s %s' % (x['metric'].get('no'), x['metric'].get('caminho'))
+                      for x in prom_query('%s_no_caminho == 0' % DECISOR)]
+        return d
 
     def historico_sonda(self):
         """Faixa de disponibilidade por tenant, um valor por bloco da barra.
@@ -1559,9 +1593,9 @@ def _por_no(cluster, unidades):
     for u in unidades:
         if not getattr(u, 'caixa', ''):
             continue
-        dados[getattr(u, 'sigla', u.nome[:3])] = {'rotulo': u.rotulo, 'unidade': u, 'tenants': 0,
-                          'mem': 0.0, 'replicas': 0, 'destino': '',
-                          'lag': None, 'paradas': 0}
+        dados[getattr(u, 'sigla', u.nome[:3])] = {
+            'rotulo': u.rotulo, 'unidade': u, 'tenants': 0, 'mem': 0.0,
+            'replicas': 0, 'origens': {}, 'lag': None, 'paradas': 0}
     for x in linhas:
         d = dados.get(x['no'])
         if d is not None:
@@ -1570,7 +1604,7 @@ def _por_no(cluster, unidades):
         r = dados.get(x['no_rep'])
         if r is not None and x['rep'][0]:
             r['replicas'] += 1
-            r['destino'] = x['no']
+            r['origens'][x['no']] = r['origens'].get(x['no'], 0) + 1
             if x['rep'][2] is not None:
                 r['lag'] = max(r['lag'] or 0, x['rep'][2])
             if not x['rep'][1]:
@@ -1578,31 +1612,96 @@ def _por_no(cluster, unidades):
     return dados, linhas
 
 
-def _linha_failover(dados):
-    """Se um no cair, o parceiro aguenta os tenants dele pela memoria?
+def _linha_failover(dados, linhas):
+    """Se um no cair, para onde vao os tenants dele e como fica a memoria de la?
 
-    A conta e a memoria dos tenants do no que caiu somada ao que o parceiro
-    ja usa, contra o teto de seguranca do parceiro. So faz sentido entre nos
-    que hospedam tenant, entao a MELCHIOR fica fora enquanto nao tiver disco.
+    Com dois nos a conta era trivial: o parceiro absorvia tudo. Com tres ou
+    mais, "o parceiro" deixa de existir, e escolher o no com mais folga na hora
+    tambem esta errado: um tenant so pode subir onde ja existe a copia quente
+    dele. Entao a conta agrupa os tenants do no que caiu pelo no que guarda a
+    replica de cada um, e mostra como ficaria a memoria de cada destino.
+
+    Tenant sem replica nao vai a lugar nenhum e aparece contado a parte, porque
+    e exatamente o que ficaria fora do ar.
     """
     siglas = [k for k, d in dados.items() if d['tenants']]
-    if len(siglas) != 2:
-        return Text('failover  precisa de dois nos com tenant para a conta',
+    if len(siglas) < 2:
+        return Text('failover  precisa de pelo menos dois nos com tenant',
                     style=FOSCO)
     saida = Text()
-    for cai, fica in ((siglas[0], siglas[1]), (siglas[1], siglas[0])):
-        u = dados[fica]['unidade']
-        if not u.mem_total:
+    for cai in siglas:
+        peso, orfaos = {}, 0
+        for x in linhas:
+            if x['no'] != cai:
+                continue
+            guarda = x['no_rep'] if x['rep'][0] else None
+            if guarda not in dados or guarda == cai:
+                orfaos += 1
+                continue
+            peso[guarda] = peso.get(guarda, 0) + (x['app_mem'] or 0) + (x['db_mem'] or 0)
+        if not peso and not orfaos:
             continue
-        depois = (u.mem_usada + dados[cai]['mem']) / u.mem_total * 100
-        cor = VERDE if depois < TETO_MEM * 100 else LARANJA_FORTE
         if saida.plain:
-            saida.append('  ', style=FOSCO)
+            saida.append('   ', style=FOSCO)
         else:
             saida.append('failover  ', style=FOSCO)
         saida.append('%s cai: ' % cai, style=AMBAR)
-        saida.append('%s %.0f%%' % (fica, depois), style=cor)
+        primeiro = True
+        for sig in sorted(peso, key=lambda k: -peso[k]):
+            u = dados[sig]['unidade']
+            if not u.mem_total:
+                continue
+            depois = (u.mem_usada + peso[sig]) / u.mem_total * 100
+            if not primeiro:
+                saida.append('+', style=FOSCO)
+            primeiro = False
+            saida.append('%s %.0f%% ' % (sig, depois),
+                         style=VERDE if depois < TETO_MEM * 100 else LARANJA_FORTE)
+        if orfaos:
+            saida.append('%d sem replica ' % orfaos, style=FOSCO)
     return saida
+
+
+def _linha_decisor(cluster):
+    """Uma linha para o decisor de failover, quando existe um configurado.
+
+    Ele nao e uma unidade, entao nao cabe em nenhuma das outras abas. As tres
+    coisas que importam, nesta ordem: esta avaliando agora, esta enxergando, e
+    esta so olhando ou pode agir. A quarta so aparece quando tem problema.
+    """
+    with cluster.lock:
+        d = dict(getattr(cluster, 'decisor', None) or {})
+    t = Text()
+    t.append('decisor   ', style=FOSCO)
+    if not d or d.get('ausente'):
+        t.append('sem metrica', style=LARANJA_FORTE)
+        return t
+
+    idade = d.get('idade')
+    if idade is None:
+        t.append('sem leitura  ', style=LARANJA_FORTE)
+    elif idade > 180:
+        t.append('PAROU ha %dmin  ' % (idade / 60), style='bold %s' % VERMELHO)
+    else:
+        t.append('ha %ds  ' % int(idade), style=VERDE)
+
+    if d.get('autoteste') is False:
+        t.append('ABSTEM  ', style='bold %s' % VERMELHO)
+    elif d.get('autoteste'):
+        t.append('enxergando  ', style=VERDE)
+
+    modo = d.get('modo', '?')
+    t.append('%s  ' % modo, style=AMBAR if modo == 'armado' else FOSCO)
+
+    mudos = d.get('mudos') or []
+    cand = d.get('candidatos') or []
+    if cand:
+        t.append('QUEDA: %s' % ', '.join(cand), style='bold %s' % VERMELHO)
+    elif mudos:
+        t.append('mudo: %s' % ', '.join(mudos[:2]), style=LARANJA_FORTE)
+    else:
+        t.append('caminhos ok, janela %smin' % d.get('janela', '?'), style=FOSCO)
+    return t
 
 
 def painel_cluster(cluster, unidades):
@@ -1625,7 +1724,9 @@ def painel_cluster(cluster, unidades):
                  style=AMBAR if d['mem'] else FOSCO)
         t.append_text(barra(d['mem'] / pico * 100, 14))
         esq.append(t)
-    esq.append(_linha_failover(dados))
+    esq.append(_linha_failover(dados, linhas))
+    if DECISOR:
+        esq.append(_linha_decisor(cluster))
 
     dir_ = [Text('REPLICACAO E DISPONIBILIDADE', style='bold %s' % LARANJA)]
     for sig, d in dados.items():
@@ -1634,8 +1735,10 @@ def painel_cluster(cluster, unidades):
         if not d['replicas']:
             t.append('nao guarda replica', style=FOSCO)
         else:
-            t.append('guarda %d de %s  ' % (d['replicas'], d['destino']),
-                     style=AMBAR)
+            de = ', '.join('%d %s' % (q, o) for o, q in
+                            sorted(d['origens'].items(), key=lambda p: -p[1]))
+            t.append('guarda %d  ' % d['replicas'], style=AMBAR)
+            t.append('(%s)  ' % de, style=FOSCO)
             if d['paradas']:
                 t.append('%d PARADAS' % d['paradas'],
                          style='bold %s' % VERMELHO)

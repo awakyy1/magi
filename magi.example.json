@@ -27,6 +27,9 @@
     "servico_app": "app",
     "servico_banco": "db",
 
+    "//ocultar": "opcional. Nomes de tenant que nao devem aparecer na interface, por exemplo bancada de teste. Lista vazia ou chave ausente mostra todos",
+    "ocultar": [],
+
     "//decisor": "opcional. Prefixo das metricas de um decisor de failover que viva FORA do cluster. Com 'decisor' o programa procura decisor_failover_info, decisor_autoteste, decisor_ultima_avaliacao_timestamp, decisor_no_candidato e decisor_no_caminho. Sem esta chave, a linha do decisor nao aparece",
     "decisor": ""
   },

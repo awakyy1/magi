@@ -477,6 +477,9 @@ class Cluster:
         self.l_box = CLUSTER.get('label_box', 'box')
         self.svc_app = CLUSTER.get('servico_app', '')
         self.svc_banco = CLUSTER.get('servico_banco', '')
+        # bancada de teste nao e cliente: ela nao tem replica, nao entra no
+        # failover, e ainda assim ocupa uma linha da faixa e entra na conta
+        self.ocultos = set(CLUSTER.get('ocultar') or [])
 
     def _sigla(self, caixa):
         for u in self.unidades:
@@ -537,6 +540,8 @@ class Cluster:
 
         linhas = []
         for tenant in sorted(v_prim):
+            if tenant in self.ocultos:
+                continue
             g = uso.get((tenant, self.svc_app), {}) if self.svc_app else {}
             d = uso.get((tenant, self.svc_banco), {}) if self.svc_banco else {}
             tem_rep = tenant in v_io

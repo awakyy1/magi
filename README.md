@@ -48,15 +48,21 @@ appears:
   "label_box": "box",
   "servico_app": "app",
   "servico_banco": "db",
+  "ocultar": [],
   "decisor": ""
 }
 ```
 
 Only `job_banco` is required; drop `job_replica` or `job_sonda` and those
-columns simply stay empty. To place tenants on nodes, give each node a `caixa`
-(the value your database metrics carry in the `label_box` label) and a short
-`sigla`. From 156 columns wide the tab splits per node side by side, which is
-the view that shows imbalance.
+columns simply stay empty. `ocultar` takes tenant names that should not show up
+at all, which is useful for test benches: they have no replica, never take part
+in a failover, and still cost a row in the availability strip and a share of the
+"where would this node's tenants go" arithmetic.
+
+To place tenants on nodes, give each node a `caixa` (the value your database
+metrics carry in the `label_box` label) and a short `sigla`. From 156 columns
+wide the tab splits per node side by side, which is the view that shows
+imbalance.
 
 ### Where a node's tenants would go
 

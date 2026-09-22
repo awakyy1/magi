@@ -273,7 +273,11 @@ pub fn buscar(unidades: &[Arc<Mutex<Unidade>>]) -> Result<Vec<Linha>, String> {
         }
     }
 
-    let mut tenants: Vec<String> = v_prim.keys().cloned().filter(|t| !t.is_empty()).collect();
+    let mut tenants: Vec<String> = v_prim
+        .keys()
+        .cloned()
+        .filter(|t| !t.is_empty() && !c.ocultar.iter().any(|o| o == t))
+        .collect();
     tenants.sort();
 
     let mut linhas = Vec::with_capacity(tenants.len());

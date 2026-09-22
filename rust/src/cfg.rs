@@ -62,6 +62,8 @@ pub struct ClusterCfg {
     /// Prefixo das metricas de um decisor de failover que viva FORA do
     /// cluster. Vazio desliga a linha e nao faz consulta nenhuma.
     pub decisor: String,
+    /// Tenants que nao aparecem na interface, por exemplo bancada de teste.
+    pub ocultar: Vec<String>,
 }
 
 pub struct Config {
@@ -161,6 +163,14 @@ pub fn carregar() -> Result<(), String> {
             servico_app: bc["servico_app"].as_str().unwrap_or("").to_string(),
             servico_banco: bc["servico_banco"].as_str().unwrap_or("").to_string(),
             decisor: bc["decisor"].as_str().unwrap_or("").to_string(),
+            ocultar: bc["ocultar"]
+                .as_array()
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }),
         _ => None,
     };
